@@ -32,6 +32,11 @@ REPO_DATA = HERE / "data"          # bundled with the repo (cloud deploy)
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Entities whose billing dates should be remapped through period_calendar
+# (Jan 31 / June 1 / etc. cutoffs). CTS bills cleanly on Sundays with no
+# period-end pulling, so it stays out of this set.
+ENTITIES_WITH_PERIOD_REMAP: set[str] = {"ots"}
+
 # Each entity has an ordered list of candidate paths. The first existing path
 # is used. Order: local OneDrive first (live data on Phil's machine), then
 # repo-bundled data/ (works on Streamlit Cloud). This means locally you keep
@@ -79,12 +84,14 @@ def entity_paths(entity: str) -> tuple[Path | None, Path | None]:
 
 
 def _effective_date(row):
-    """Return the period-anchored date used by the match key (so the month
-    filter routes a 2026-05-31 row into June if the cutoff rule applies)."""
+    """Return the date used by the match key. Mirrors the row's own .key
+    logic — period-anchored only when the row's apply_period_remap flag is
+    set (OTS yes, CTS no)."""
+    apply = getattr(row, "apply_period_remap", True)
     for attr in ("parsed_date", "txn_date", "invoice_date"):
         d = getattr(row, attr, None)
         if d:
-            return to_period_anchor(d)
+            return to_period_anchor(d) if apply else d
     return None
 
 
@@ -253,13 +260,15 @@ def reconcile_entity(entity: str, *, month: str | None = None,
         if verbose:
             print(msg)
 
-    log(f"\n=== {cfg['label']} ===")
+    apply_remap = entity in ENTITIES_WITH_PERIOD_REMAP
+
+    log(f"\n=== {cfg['label']} ===  (period_remap={'on' if apply_remap else 'off'})")
     log(f"Loading QBO  : {qbo_path.name}")
-    qbo_rows = load_qbo(qbo_path)
+    qbo_rows = load_qbo(qbo_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(qbo_rows)} rows")
 
     log(f"Loading ATS  : {ats_path.name}")
-    ats_rows = load_bullhorn(ats_path)
+    ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(ats_rows)} rows")
 
     if month:

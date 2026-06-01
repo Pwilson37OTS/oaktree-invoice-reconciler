@@ -77,16 +77,16 @@ class QBORow:
     candidate_id: str | None
     parsed_date: date | None
     product: str = ""
+    apply_period_remap: bool = True  # entities like CTS pass False — see reconcile.ENTITIES_WITH_PERIOD_REMAP
 
     @property
     def key(self) -> str | None:
-        """candidate_id|YYYY-MM-DD using the accounting-period-anchored date.
-
-        Cross-period billings (e.g. 2026-05-31 → 2026-06-01) collapse to a
-        single key so Bullhorn and QBO match even when one side carries the
-        raw date and the other the anchor.
-        """
-        d = to_period_anchor(self.parsed_date or self.txn_date)
+        """candidate_id|YYYY-MM-DD. Anchors cross-period billings (e.g.
+        2026-05-31 → 2026-06-01) when apply_period_remap=True, otherwise
+        uses the raw date as-is."""
+        d = self.parsed_date or self.txn_date
+        if self.apply_period_remap:
+            d = to_period_anchor(d)
         if not self.candidate_id or not d:
             return None
         return f"{self.candidate_id}|{d.isoformat()}"
@@ -190,8 +190,13 @@ def _cell(cells, col_idx: int | None):
     return cells[col_idx - 1]
 
 
-def load_qbo(path: Path, header_row: int = DEFAULT_HEADER_ROW) -> list[QBORow]:
-    """Load a QBO Revenue Audit Report. Auto-detects column layout from header."""
+def load_qbo(path: Path, header_row: int = DEFAULT_HEADER_ROW,
+             apply_period_remap: bool = True) -> list[QBORow]:
+    """Load a QBO Revenue Audit Report. Auto-detects column layout from header.
+
+    apply_period_remap: if False, raw dates are kept (used for CTS, which
+    bills weekly on Sundays with no period-end pulling).
+    """
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
 
@@ -260,6 +265,7 @@ def load_qbo(path: Path, header_row: int = DEFAULT_HEADER_ROW) -> list[QBORow]:
                 candidate_id=candidate_id,
                 parsed_date=parsed_date,
                 product=product,
+                apply_period_remap=apply_period_remap,
             )
         )
 

@@ -68,11 +68,14 @@ class BHRow:
     period_end: date | None
     branch: str
     employee_type: str
+    apply_period_remap: bool = True  # CTS passes False — see reconcile.ENTITIES_WITH_PERIOD_REMAP
 
     @property
     def key(self) -> str | None:
-        """candidate_id|YYYY-MM-DD using the accounting-period-anchored date."""
-        d = to_period_anchor(self.invoice_date)
+        """candidate_id|YYYY-MM-DD. Period-anchored when apply_period_remap=True."""
+        d = self.invoice_date
+        if self.apply_period_remap:
+            d = to_period_anchor(d)
         if not self.candidate_id or not d:
             return None
         return f"{self.candidate_id}|{d.isoformat()}"
@@ -110,7 +113,12 @@ def _to_str(v) -> str:
     return str(v).strip()
 
 
-def load_bullhorn(path: Path) -> list[BHRow]:
+def load_bullhorn(path: Path, apply_period_remap: bool = True) -> list[BHRow]:
+    """Load Bullhorn billable_charges export.
+
+    apply_period_remap: if False, raw dates are kept (used for CTS, which
+    bills weekly on Sundays with no period-end pulling).
+    """
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     # Pick the first sheet (currently 'Page1_1'; tolerate renames).
     ws = wb[wb.sheetnames[0]]
@@ -145,6 +153,7 @@ def load_bullhorn(path: Path) -> list[BHRow]:
                 period_end=_to_date(cells[COL_PERIOD_END - 1]),
                 branch=_to_str(cells[COL_BRANCH - 1]),
                 employee_type=_to_str(cells[COL_EMP_TYPE - 1]),
+                apply_period_remap=apply_period_remap,
             )
         )
 
