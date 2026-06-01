@@ -28,7 +28,7 @@ import pandas as pd
 import streamlit as st
 
 from reconcile import (
-    ENTITY_CONFIG, reconcile_entity, write_excel_snapshot,
+    ENTITY_CONFIG, entity_paths, reconcile_entity, write_excel_snapshot,
     STATUS_CLEAN, STATUS_PENNY, STATUS_ZERO_NO_ACTION, STATUS_EXPENSE_RECLASS,
 )
 
@@ -120,17 +120,17 @@ def run_from_uploads(entity: str, qbo_file, ats_file) -> dict:
 
 
 def maybe_autoload(entity: str) -> dict | None:
-    """If running on a machine that has the canonical files at the default
-    paths (e.g. Phil's machine with OneDrive synced), auto-run the engine.
-    On Streamlit Cloud these paths won't exist — returns None and the user
-    falls back to manual upload."""
-    cfg = ENTITY_CONFIG[entity]
-    if not (cfg["qbo"].exists() and cfg["ats"].exists()):
+    """Auto-run the engine if source files are present at any configured
+    candidate path. Order: local OneDrive (live data on Phil's machine) →
+    repo-bundled data/ (Streamlit Cloud deploy). If neither is present,
+    return None and the user uploads manually."""
+    qbo, ats = entity_paths(entity)
+    if not (qbo and ats):
         return None
     try:
         return reconcile_entity(entity, write_outputs=False, verbose=False)
     except Exception as e:
-        st.warning(f"Auto-load from local paths failed for {entity.upper()}: {e}")
+        st.warning(f"Auto-load failed for {entity.upper()}: {e}")
         return None
 
 

@@ -26,22 +26,56 @@ from classify import (
 )
 from period_calendar import to_period_anchor
 
-ROOT = Path(__file__).resolve().parents[2]  # OakTree Operations
-OUT_DIR = Path(__file__).resolve().parent / "output"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]  # OakTree Operations
+REPO_DATA = HERE / "data"          # bundled with the repo (cloud deploy)
+OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Each entity has an ordered list of candidate paths. The first existing path
+# is used. Order: local OneDrive first (live data on Phil's machine), then
+# repo-bundled data/ (works on Streamlit Cloud). This means locally you keep
+# seeing fresh OneDrive-synced data; in the cloud you see whatever was last
+# committed to data/.
 ENTITY_CONFIG: dict[str, dict] = {
     "ots": {
         "label": "OTS",
-        "qbo": ROOT / "_shared" / "quickbooks-data" / "audit_rev_ots.xlsx",
-        "ats": ROOT / "_shared" / "bullhorn-data" / "billable_charges.xlsx",
+        "qbo_candidates": [
+            ROOT / "_shared" / "quickbooks-data" / "audit_rev_ots.xlsx",
+            REPO_DATA / "audit_rev_ots.xlsx",
+        ],
+        "ats_candidates": [
+            ROOT / "_shared" / "bullhorn-data" / "billable_charges.xlsx",
+            REPO_DATA / "billable_charges.xlsx",
+        ],
     },
     "cts": {
         "label": "CTS",
-        "qbo": ROOT / "_shared" / "quickbooks-data" / "audit_rev_cts.xlsx",
-        "ats": ROOT / "_shared" / "bullhorn-data" / "billable_charges_CTS.xlsx",
+        "qbo_candidates": [
+            ROOT / "_shared" / "quickbooks-data" / "audit_rev_cts.xlsx",
+            REPO_DATA / "audit_rev_cts.xlsx",
+        ],
+        "ats_candidates": [
+            ROOT / "_shared" / "bullhorn-data" / "billable_charges_CTS.xlsx",
+            REPO_DATA / "billable_charges_CTS.xlsx",
+        ],
     },
 }
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    """Return the first path that exists, or None."""
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+def entity_paths(entity: str) -> tuple[Path | None, Path | None]:
+    """Resolve the (qbo, ats) source paths for an entity by checking
+    candidates in order."""
+    cfg = ENTITY_CONFIG[entity]
+    return _first_existing(cfg["qbo_candidates"]), _first_existing(cfg["ats_candidates"])
 
 
 def _effective_date(row):
@@ -204,8 +238,14 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     holds the returned dict in memory.
     """
     cfg = ENTITY_CONFIG[entity]
-    qbo_path = qbo_path or cfg["qbo"]
-    ats_path = ats_path or cfg["ats"]
+    default_qbo, default_ats = entity_paths(entity)
+    qbo_path = qbo_path or default_qbo
+    ats_path = ats_path or default_ats
+    if not (qbo_path and ats_path):
+        raise FileNotFoundError(
+            f"No source files found for {entity}. Checked: "
+            f"qbo={cfg['qbo_candidates']}, ats={cfg['ats_candidates']}"
+        )
     out_json = out_json or (OUT_DIR / f"{entity}_invoice_reconciliation_data.json")
     out_xlsx = out_xlsx or (OUT_DIR / f"audit_{entity}_{month or 'all'}.xlsx")
 
