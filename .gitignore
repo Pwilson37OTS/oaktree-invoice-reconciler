@@ -1,0 +1,25 @@
+# Sensitive data — never commit
+_inputs/
+output/
+*.xlsx
+*.xlsm
+
+# But DO keep the legacy VBA source for reference
+!_inputs/Revenue_Audit_VBA_source.bas
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
