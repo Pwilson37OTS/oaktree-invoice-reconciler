@@ -87,6 +87,7 @@ Send the URL to the people who need access. They'll need:
 
 ## Updating the deployed app
 
+### Code changes
 Push to the `main` branch and Streamlit Cloud auto-redeploys (~30 seconds).
 
 ```powershell
@@ -95,6 +96,24 @@ git commit -m "Describe the change"
 git push
 ```
 
+### Data refresh
+The source xlsx files are bundled in `data/`. To push fresh data to the
+cloud after Brenda updates the QBO and Bullhorn exports:
+
+```powershell
+.\refresh_data.ps1
+```
+
+This script copies the four files from `_shared/` (your OneDrive-synced
+folder) into `data/`, commits, and pushes. It skips the commit if nothing
+actually changed.
+
+If you want fully hands-free refresh, schedule it via Windows Task
+Scheduler — point it at this script and pick a cadence (daily, hourly,
+etc.). The cloud app stays current as long as your machine is on and
+OneDrive is syncing.
+
+### Restarting / debugging
 The deployed app shows a "Manage app" link in the bottom-right — useful for
 viewing logs or restarting if something's stuck.
 
