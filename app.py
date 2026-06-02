@@ -67,6 +67,22 @@ NON_ACTIONABLE = {"CLEAN", "PENNY_ROUND", "ZERO_AMOUNT_NO_ACTION", "EXPENSE_RECL
 
 RENDER_ROW_CAP = 500
 
+# Per-entity QBO-account headline breakdown. Each entry is a label shown on
+# the tile and a list of account-name prefixes (startswith match against the
+# QBO line's "Full name" / "Distribution account" column).
+# Add categories or rename labels here — the dashboard picks them up
+# automatically on next refresh. An empty list = no breakdown row for that entity.
+ACCOUNT_BREAKDOWN: dict[str, list[tuple[str, list[str]]]] = {
+    "ots": [
+        ("Employee Advance", ["Employee Advance"]),
+        ("Primary Sales",    ["Primary Sales"]),     # matches "Primary Sales:Revenue-Placement" etc.
+        ("Employee Wages",   ["Employee Wages"]),
+    ],
+    # CTS account-name conventions differ — fill in when Phil shares the
+    # canonical account categories.
+    "cts": [],
+}
+
 
 # -------------------------- date helpers --------------------------
 
@@ -177,7 +193,28 @@ def save_close_log(log: dict) -> None:
 
 # -------------------------- rendering --------------------------
 
-def render_tiles(df: pd.DataFrame) -> None:
+def _account_breakdown(payload: dict, filter_keys: set[str], categories: list[tuple[str, list[str]]]) -> dict[str, float]:
+    """Sum sign-corrected qbo_line amounts by account category. Restricted
+    to reconciled rows whose `key` is in `filter_keys` (respects the active
+    Month/Week/Status/Client filters)."""
+    totals = {label: 0.0 for label, _ in categories}
+    if not filter_keys:
+        return totals
+    for row in payload.get("rows", []):
+        if row["key"] not in filter_keys:
+            continue
+        for q in row.get("qbo_lines", []):
+            acct = (q.get("account") or "").strip()
+            if not acct:
+                continue
+            for label, prefixes in categories:
+                if any(acct.startswith(p) for p in prefixes):
+                    totals[label] = round(totals[label] + (q.get("amount") or 0.0), 2)
+                    break  # first matching category wins; no double-counting
+    return totals
+
+
+def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | None = None) -> None:
     qbo_total = round(df["qbo_amount"].fillna(0).sum(), 2)
     ats_total = round(df["ats_amount"].fillna(0).sum(), 2)
     net = round(ats_total - qbo_total, 2)
@@ -192,6 +229,16 @@ def render_tiles(df: pd.DataFrame) -> None:
               delta_color="inverse" if abs(net) >= 0.01 else "off")
     c4.metric("Exceptions", int(exceptions))
     c5.metric("Material variances", int(material), delta_color="inverse")
+
+    # Optional second-row breakdown by QBO account category
+    categories = ACCOUNT_BREAKDOWN.get(entity or "", [])
+    if not categories or payload is None or df.empty:
+        return
+    filter_keys = set(df["key"])
+    totals = _account_breakdown(payload, filter_keys, categories)
+    cols = st.columns(len(categories))
+    for col, (label, _) in zip(cols, categories):
+        col.metric(label, f"${totals[label]:,.2f}")
 
 
 def style_status(val):
@@ -363,7 +410,7 @@ def render_upload_form(entity: str) -> None:
 
 def page_continuous(payload: dict, df: pd.DataFrame, entity: str) -> None:
     filtered = render_filters(df, prefix=f"{entity}_cont")
-    render_tiles(filtered)
+    render_tiles(filtered, payload=payload, entity=entity)
     st.markdown("### Reconciled rows")
     render_table(filtered)
     st.markdown("### Drill-down")
@@ -386,7 +433,7 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
             f"(Session-scoped — re-download the snapshot below if you need a permanent record.)"
         )
 
-    render_tiles(sub)
+    render_tiles(sub, payload=payload, entity=entity)
     st.markdown(f"### Reconciled rows — {ENTITIES[entity]['short']} · {month}")
     render_table(sub)
     st.markdown("### Drill-down")
