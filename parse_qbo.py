@@ -230,8 +230,12 @@ def load_qbo(path: Path, header_row: int = DEFAULT_HEADER_ROW,
 
         candidate_id, parsed_date = _parse_description(desc)
 
-        # Backfill date: parsed_date wins, else col-Date, else last seen.
-        txn_date = parsed_date or _to_date(_cell(cells, cols.get("date"))) or last_known_date
+        # txn_date = the actual Transaction Date column (P&L / booking date).
+        # Backfills from the previous data row when blank (QBO groups multi-
+        # line invoices under one date). Used for the P&L-month view.
+        # parsed_date (from Description) is kept separately and used for the
+        # match key — that's the service-week date and ties to Bullhorn.
+        txn_date = _to_date(_cell(cells, cols.get("date"))) or last_known_date
         if txn_date:
             last_known_date = txn_date
 

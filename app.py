@@ -193,6 +193,27 @@ def save_close_log(log: dict) -> None:
 
 # -------------------------- rendering --------------------------
 
+def _pl_total(payload: dict, month: str | None) -> float:
+    """Sum every QBO line whose Transaction Date (column B in the source) is
+    in `month` (YYYY-MM). When `month` is None, sums across all months —
+    matches a P&L view rather than the reconciliation view.
+
+    Notably, this DIFFERS from the QBO Revenue tile when a Credit Memo's
+    txn_date is in one month but the service-week date in its Description
+    points to another — e.g. a May-15 CM correcting a March-29 service week
+    lands in May for P&L but in March for reconciliation.
+    """
+    total = 0.0
+    for row in payload.get("rows", []):
+        for q in row.get("qbo_lines", []):
+            d = q.get("txn_date")
+            if not d:
+                continue
+            if month is None or d.startswith(month):
+                total += q.get("amount") or 0.0
+    return round(total, 2)
+
+
 def _account_breakdown(payload: dict, filter_keys: set[str], categories: list[tuple[str, list[str]]]) -> dict[str, float]:
     """Sum sign-corrected qbo_line amounts by account category. Restricted
     to reconciled rows whose `key` is in `filter_keys` (respects the active
@@ -214,21 +235,33 @@ def _account_breakdown(payload: dict, filter_keys: set[str], categories: list[tu
     return totals
 
 
-def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | None = None) -> None:
+def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | None = None,
+                 pl_month: str | None = None) -> None:
     qbo_total = round(df["qbo_amount"].fillna(0).sum(), 2)
     ats_total = round(df["ats_amount"].fillna(0).sum(), 2)
     net = round(ats_total - qbo_total, 2)
     exceptions = (~df["status"].isin(NON_ACTIONABLE)).sum() if not df.empty else 0
     material = (df["status"] == "MATERIAL_VARIANCE").sum() if not df.empty else 0
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Bullhorn billed", f"${ats_total:,.2f}")
-    c2.metric("QBO revenue", f"${qbo_total:,.2f}")
-    c3.metric("Net variance", f"${net:,.2f}",
+    c2.metric("QBO revenue (recon)", f"${qbo_total:,.2f}",
+              help="Reconciliation view — buckets each QBO line by its service-week date "
+                   "(parsed from the Description). Used for matching against Bullhorn.")
+    if payload is not None:
+        pl = _pl_total(payload, pl_month)
+        c3.metric("QBO P&L (txn date)", f"${pl:,.2f}",
+                  help="P&L view — buckets each QBO line by its Transaction Date column "
+                      "(when QBO actually booked the entry). May differ from QBO recon when "
+                      "Credit Memos for prior-month service weeks are booked in the current "
+                      "month — e.g. a May-15 CM for a March-29 service week sits in May here.")
+    else:
+        c3.metric("QBO P&L (txn date)", "—")
+    c4.metric("Net variance", f"${net:,.2f}",
               delta=None if abs(net) < 0.01 else f"{net:+,.2f}",
               delta_color="inverse" if abs(net) >= 0.01 else "off")
-    c4.metric("Exceptions", int(exceptions))
-    c5.metric("Material variances", int(material), delta_color="inverse")
+    c5.metric("Exceptions", int(exceptions))
+    c6.metric("Material variances", int(material), delta_color="inverse")
 
     # Optional second-row breakdown by QBO account category
     categories = ACCOUNT_BREAKDOWN.get(entity or "", [])
@@ -410,7 +443,9 @@ def render_upload_form(entity: str) -> None:
 
 def page_continuous(payload: dict, df: pd.DataFrame, entity: str) -> None:
     filtered = render_filters(df, prefix=f"{entity}_cont")
-    render_tiles(filtered, payload=payload, entity=entity)
+    selected_month = st.session_state.get(f"{entity}_cont_month")
+    pl_month = selected_month if selected_month and selected_month != "(all)" else None
+    render_tiles(filtered, payload=payload, entity=entity, pl_month=pl_month)
     st.markdown("### Reconciled rows")
     render_table(filtered)
     st.markdown("### Drill-down")
@@ -433,7 +468,7 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
             f"(Session-scoped — re-download the snapshot below if you need a permanent record.)"
         )
 
-    render_tiles(sub, payload=payload, entity=entity)
+    render_tiles(sub, payload=payload, entity=entity, pl_month=month)
     st.markdown(f"### Reconciled rows — {ENTITIES[entity]['short']} · {month}")
     render_table(sub)
     st.markdown("### Drill-down")
