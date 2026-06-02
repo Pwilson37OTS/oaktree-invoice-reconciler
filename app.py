@@ -261,27 +261,32 @@ def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | No
     exceptions = (~df["status"].isin(NON_ACTIONABLE)).sum() if not df.empty else 0
     material = (df["status"] == "MATERIAL_VARIANCE").sum() if not df.empty else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Bullhorn billed", f"${ats_total:,.2f}")
-    c2.metric("QBO revenue (recon)", f"${qbo_total:,.2f}",
-              help="Reconciliation view — buckets each QBO line by its service-week date "
-                   "(parsed from the Description). Used for matching against Bullhorn.")
+    # Two rows of 3 tiles each — 6 tiles in a single row clip dollar
+    # amounts on narrow screens. Top row: financial totals.
+    # Bottom row: variance / health metrics.
+    r1c1, r1c2, r1c3 = st.columns(3)
+    r1c1.metric("Bullhorn billed", f"${ats_total:,.2f}")
+    r1c2.metric("QBO revenue (recon)", f"${qbo_total:,.2f}",
+                help="Reconciliation view — buckets each QBO line by its service-week date "
+                     "(parsed from the Description). Used for matching against Bullhorn.")
     if payload is not None:
         revenue_prefixes = PL_REVENUE_PREFIXES.get(entity or "", [])
         pl = _pl_total(payload, pl_month, revenue_prefixes)
-        c3.metric("QBO P&L (txn date)", f"${pl:,.2f}",
-                  help="P&L view — sums revenue-account QBO lines (Primary Sales for OTS) "
-                      "by their Transaction Date column (when QBO actually booked the entry). "
-                      "Excludes clearing accounts (Employee Advance) and cost accounts "
-                      "(Employee Wages). May differ from QBO recon when Credit Memos for "
-                      "prior-month service weeks are booked in the current month.")
+        r1c3.metric("QBO P&L (txn date)", f"${pl:,.2f}",
+                    help="P&L view — sums revenue-account QBO lines (Primary Sales for OTS) "
+                        "by their Transaction Date column (when QBO actually booked the entry). "
+                        "Excludes clearing accounts (Employee Advance) and cost accounts "
+                        "(Employee Wages). May differ from QBO recon when Credit Memos for "
+                        "prior-month service weeks are booked in the current month.")
     else:
-        c3.metric("QBO P&L (txn date)", "—")
-    c4.metric("Net variance", f"${net:,.2f}",
-              delta=None if abs(net) < 0.01 else f"{net:+,.2f}",
-              delta_color="inverse" if abs(net) >= 0.01 else "off")
-    c5.metric("Exceptions", int(exceptions))
-    c6.metric("Material variances", int(material), delta_color="inverse")
+        r1c3.metric("QBO P&L (txn date)", "—")
+
+    r2c1, r2c2, r2c3 = st.columns(3)
+    r2c1.metric("Net variance", f"${net:,.2f}",
+                delta=None if abs(net) < 0.01 else f"{net:+,.2f}",
+                delta_color="inverse" if abs(net) >= 0.01 else "off")
+    r2c2.metric("Exceptions", int(exceptions))
+    r2c3.metric("Material variances", int(material), delta_color="inverse")
 
     # Optional second-row breakdown by QBO account category
     categories = ACCOUNT_BREAKDOWN.get(entity or "", [])
