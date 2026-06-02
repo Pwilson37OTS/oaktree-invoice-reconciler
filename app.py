@@ -83,6 +83,16 @@ ACCOUNT_BREAKDOWN: dict[str, list[tuple[str, list[str]]]] = {
     "cts": [],
 }
 
+# QBO account prefixes that count as P&L revenue. The QBO P&L tile sums
+# only lines whose account starts with one of these prefixes. Clearing
+# accounts (Employee Advance) and cost accounts (Employee Wages) are
+# intentionally excluded — they're not P&L revenue.
+# Empty list = include all accounts (gross sum).
+PL_REVENUE_PREFIXES: dict[str, list[str]] = {
+    "ots": ["Primary Sales"],
+    "cts": [],  # TBD when Phil shares CTS account conventions
+}
+
 
 # -------------------------- date helpers --------------------------
 
@@ -193,15 +203,19 @@ def save_close_log(log: dict) -> None:
 
 # -------------------------- rendering --------------------------
 
-def _pl_total(payload: dict, month: str | None) -> float:
-    """Sum every QBO line whose Transaction Date (column B in the source) is
-    in `month` (YYYY-MM). When `month` is None, sums across all months —
-    matches a P&L view rather than the reconciliation view.
+def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> float:
+    """Sum every QBO line whose Transaction Date is in `month` (YYYY-MM) AND
+    whose account starts with one of `revenue_prefixes`. Matches what shows
+    up on the QBO P&L statement — excludes clearing accounts like Employee
+    Advance and cost accounts like Employee Wages.
 
-    Notably, this DIFFERS from the QBO Revenue tile when a Credit Memo's
-    txn_date is in one month but the service-week date in its Description
-    points to another — e.g. a May-15 CM correcting a March-29 service week
-    lands in May for P&L but in March for reconciliation.
+    Empty `revenue_prefixes` list = no account filter (gross sum).
+    `month=None` = no date filter (all months).
+
+    Differs from the QBO Revenue (recon) tile because:
+    1. Account filter excludes non-revenue accounts (Employee Advance etc.)
+    2. Date filter is transaction date (P&L month), not the parsed
+       service-week date the reconciliation uses.
     """
     total = 0.0
     for row in payload.get("rows", []):
@@ -209,8 +223,12 @@ def _pl_total(payload: dict, month: str | None) -> float:
             d = q.get("txn_date")
             if not d:
                 continue
-            if month is None or d.startswith(month):
-                total += q.get("amount") or 0.0
+            if month is not None and not d.startswith(month):
+                continue
+            acct = (q.get("account") or "").strip()
+            if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+                continue
+            total += q.get("amount") or 0.0
     return round(total, 2)
 
 
@@ -249,12 +267,14 @@ def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | No
               help="Reconciliation view — buckets each QBO line by its service-week date "
                    "(parsed from the Description). Used for matching against Bullhorn.")
     if payload is not None:
-        pl = _pl_total(payload, pl_month)
+        revenue_prefixes = PL_REVENUE_PREFIXES.get(entity or "", [])
+        pl = _pl_total(payload, pl_month, revenue_prefixes)
         c3.metric("QBO P&L (txn date)", f"${pl:,.2f}",
-                  help="P&L view — buckets each QBO line by its Transaction Date column "
-                      "(when QBO actually booked the entry). May differ from QBO recon when "
-                      "Credit Memos for prior-month service weeks are booked in the current "
-                      "month — e.g. a May-15 CM for a March-29 service week sits in May here.")
+                  help="P&L view — sums revenue-account QBO lines (Primary Sales for OTS) "
+                      "by their Transaction Date column (when QBO actually booked the entry). "
+                      "Excludes clearing accounts (Employee Advance) and cost accounts "
+                      "(Employee Wages). May differ from QBO recon when Credit Memos for "
+                      "prior-month service weeks are booked in the current month.")
     else:
         c3.metric("QBO P&L (txn date)", "—")
     c4.metric("Net variance", f"${net:,.2f}",
