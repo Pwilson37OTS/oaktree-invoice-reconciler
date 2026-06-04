@@ -32,10 +32,16 @@ REPO_DATA = HERE / "data"          # bundled with the repo (cloud deploy)
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Entities whose billing dates should be remapped through period_calendar
-# (Jan 31 / June 1 / etc. cutoffs). CTS bills cleanly on Sundays with no
-# period-end pulling, so it stays out of this set.
-ENTITIES_WITH_PERIOD_REMAP: set[str] = {"ots"}
+# Entities whose match keys get remapped through period_calendar's cutoff
+# windows. This is now EMPTY: as of the June 2026 accounting change, QBO no
+# longer re-dates boundary invoices to the next accounting month — it keeps
+# the true invoice date (e.g. May 29-31 stays May) and a separate deferral
+# JE moves the revenue into the correct period. Because both QBO and Bullhorn
+# now carry the same true dates, the reconciler matches them natively without
+# remapping. period_calendar.py is still used (see app.py) to compute the
+# deferral total for month-end. To re-enable remapping for an entity, add its
+# key back here.
+ENTITIES_WITH_PERIOD_REMAP: set[str] = set()
 
 # Each entity has an ordered list of candidate paths. The first existing path
 # is used. Order: local OneDrive first (live data on Phil's machine), then

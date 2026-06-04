@@ -31,6 +31,7 @@ from reconcile import (
     ENTITY_CONFIG, entity_paths, reconcile_entity, write_excel_snapshot,
     STATUS_CLEAN, STATUS_PENNY, STATUS_ZERO_NO_ACTION, STATUS_EXPENSE_RECLASS,
 )
+from period_calendar import to_period_anchor
 
 
 HERE = Path(__file__).resolve().parent
@@ -92,6 +93,12 @@ PL_REVENUE_PREFIXES: dict[str, list[str]] = {
     "ots": ["Primary Sales"],
     "cts": [],  # TBD when Phil shares CTS account conventions
 }
+
+# Entities that have month-end period cutoffs (per period_calendar). These get
+# a deferral section in Month Close: revenue invoices booked in the current
+# month whose accounting period is actually the next month. OakTree's OTS
+# billing cycle straddles month-ends; CTS bills clean Sundays with no cutoff.
+ENTITIES_WITH_DEFERRAL = {"ots"}
 
 
 # -------------------------- date helpers --------------------------
@@ -230,6 +237,49 @@ def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> 
                 continue
             total += q.get("amount") or 0.0
     return round(total, 2)
+
+
+def _next_month_label(month: str) -> str:
+    """'2026-05' -> '2026-06'."""
+    y, m = int(month[:4]), int(month[5:7])
+    return f"{y + 1:04d}-01" if m == 12 else f"{y:04d}-{m + 1:02d}"
+
+
+def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tuple[list[dict], float]:
+    """Revenue QBO lines whose Transaction Date is in `month` but whose
+    accounting period (per period_calendar) is a LATER month — i.e. booked
+    this month, belong to next month, need a deferral JE to move them forward.
+
+    Returns (items, total). Each item is the raw qbo_line dict plus the
+    contractor it belongs to and its anchor month.
+    """
+    items: list[dict] = []
+    for row in payload.get("rows", []):
+        for q in row.get("qbo_lines", []):
+            d = q.get("txn_date")
+            if not d or not d.startswith(month):
+                continue
+            acct = (q.get("account") or "").strip()
+            if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+                continue
+            try:
+                dt = date.fromisoformat(d)
+            except (TypeError, ValueError):
+                continue
+            anchor = to_period_anchor(dt)
+            if (anchor.year, anchor.month) > (dt.year, dt.month):
+                items.append({
+                    "contractor": row.get("contractor", ""),
+                    "txn_date": d,
+                    "num": q.get("num", ""),
+                    "customer": q.get("customer", ""),
+                    "account": acct,
+                    "amount": q.get("amount", 0.0),
+                    "anchor_month": f"{anchor.year:04d}-{anchor.month:02d}",
+                    "description": q.get("description", ""),
+                })
+    total = round(sum(i["amount"] for i in items), 2)
+    return items, total
 
 
 def _account_breakdown(payload: dict, filter_keys: set[str], categories: list[tuple[str, list[str]]]) -> dict[str, float]:
@@ -477,6 +527,62 @@ def page_continuous(payload: dict, df: pd.DataFrame, entity: str) -> None:
     render_drill_down(filtered, payload, prefix=f"{entity}_cont")
 
 
+def render_deferral_section(payload: dict, month: str, entity: str) -> None:
+    """Show the period-end deferral: revenue invoices booked this month that
+    belong (per accounting cutoff) to next month, so finance can book the JE."""
+    if entity not in ENTITIES_WITH_DEFERRAL:
+        return
+
+    revenue_prefixes = PL_REVENUE_PREFIXES.get(entity, [])
+    items, total = deferral_items(payload, month, revenue_prefixes)
+    next_month = _next_month_label(month)
+
+    st.markdown("### Period-end deferral")
+    if not items:
+        st.caption(
+            f"No invoices booked in {month} fall in a cutoff window. "
+            f"Nothing to defer into {next_month}."
+        )
+        return
+
+    pl_booked = _pl_total(payload, month, revenue_prefixes)
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        f"Defer {month} → {next_month}", f"${total:,.2f}",
+        help=f"Total revenue invoices booked (Transaction Date) in {month} whose "
+             f"accounting period is {next_month}. Book a deferral JE for this amount.",
+    )
+    c2.metric(f"{month} P&L as booked", f"${pl_booked:,.2f}",
+              help="Revenue booked by Transaction Date, before the deferral JE.")
+    c3.metric(f"{month} P&L after deferral", f"${round(pl_booked - total, 2):,.2f}",
+              help="What stays in this month once the deferral moves out.")
+
+    st.caption(
+        f"{len(items)} revenue invoice line(s) dated in {month}'s cutoff window "
+        f"belong to {next_month}. Move this total with a deferral journal entry."
+    )
+
+    with st.expander(f"Show the {len(items)} invoice line(s) to defer", expanded=False):
+        ddf = pd.DataFrame(items)[
+            ["contractor", "txn_date", "num", "customer", "account", "amount", "description"]
+        ].rename(columns={
+            "contractor": "Contractor", "txn_date": "Txn date", "num": "Invoice #",
+            "customer": "Customer", "account": "Account", "amount": "Amount",
+            "description": "Description",
+        })
+        styled = ddf.style.format({"Amount": lambda v: f"${v:,.2f}"})
+        st.dataframe(styled, hide_index=True, width="stretch", height=320)
+
+        csv = ddf.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"Download deferral detail · {entity}_{month}_deferral.csv",
+            data=csv,
+            file_name=f"{entity}_{month}_deferral.csv",
+            mime="text/csv",
+            key=f"{entity}_{month}_deferral_dl",
+        )
+
+
 def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
     months = sorted(df["month"].dropna().unique(), reverse=True)
     if not months:
@@ -494,6 +600,9 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
         )
 
     render_tiles(sub, payload=payload, entity=entity, pl_month=month)
+
+    render_deferral_section(payload, month, entity)
+
     st.markdown(f"### Reconciled rows — {ENTITIES[entity]['short']} · {month}")
     render_table(sub)
     st.markdown("### Drill-down")
