@@ -664,24 +664,13 @@ def render_entity_tab(entity: str) -> None:
         f"{payload.get('summary', {}).get('actionable_exceptions', 0)} actionable exceptions"
     )
 
-    # Coverage-window warning: if QBO and Bullhorn exports don't span the same
-    # dates, tell the user rather than letting phantom exceptions pile up.
+    # Coverage window: the engine reconciles only where both exports overlap.
+    # A subtle informational caption (no warning) shows the loaded date ranges.
     cov = payload.get("coverage") or {}
     if cov.get("qbo_min") and cov.get("ats_min"):
         st.caption(
             f"Coverage — QBO: {cov['qbo_min']} → {cov['qbo_max']} · "
             f"Bullhorn: {cov['ats_min']} → {cov['ats_max']}"
-        )
-    if cov.get("excluded_ats_count"):
-        st.warning(
-            f"⚠️ **Export windows don't line up.** The QBO export only reaches back to "
-            f"**{cov['qbo_min']}**, but Bullhorn goes back to **{cov['ats_min']}**. "
-            f"Reconciliation is limited to **{cov['clip_start']} onward**; "
-            f"**{cov['excluded_ats_count']:,} Bullhorn charges "
-            f"(${cov['excluded_ats_total']:,.2f})** dated before that are outside the QBO "
-            f"window and were excluded (not counted as exceptions). "
-            f"To reconcile them, re-export the QBO Revenue Audit Report with a start date "
-            f"of {cov['ats_min']} or earlier, refresh, and re-run."
         )
 
     view = st.radio(
