@@ -277,6 +277,42 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(ats_rows)} rows")
 
+    # --- Coverage clip -------------------------------------------------------
+    # You can only reconcile where QBO has data. When the QBO export starts
+    # later than the Bullhorn export (a common export-window drift), the older
+    # Bullhorn charges have no QBO counterpart and would flood ATS_ONLY with
+    # phantom exceptions. Clip the front of the reconciliation to where BOTH
+    # sources have coverage, and report what was excluded so it's transparent.
+    # The recent tail is NOT clipped — Bullhorn charges past QBO's latest date
+    # are legitimate "not yet invoiced" items worth surfacing.
+    coverage = {"qbo_min": None, "qbo_max": None, "ats_min": None, "ats_max": None,
+                "clip_start": None, "excluded_ats_count": 0, "excluded_ats_total": 0.0}
+    # QBO coverage floor = earliest TRANSACTION date (the export's booking
+    # window), NOT the service-week date parsed from descriptions. A handful of
+    # late/corrected invoices booked in-window can reference old service weeks;
+    # those must not drag the floor back and defeat the clip.
+    qbo_txn = [r.txn_date for r in qbo_rows if r.txn_date]
+    bh_inv = [r.invoice_date for r in ats_rows if r.invoice_date]
+    if qbo_txn and bh_inv:
+        qbo_min, qbo_max = min(qbo_txn), max(qbo_txn)
+        ats_min, ats_max = min(bh_inv), max(bh_inv)
+        coverage.update(qbo_min=qbo_min.isoformat(), qbo_max=qbo_max.isoformat(),
+                        ats_min=ats_min.isoformat(), ats_max=ats_max.isoformat())
+        clip_start = max(qbo_min, ats_min)
+        if clip_start > ats_min:
+            # Clip both sides by service-week (effective) date so a Bullhorn
+            # charge and its QBO invoice drop together — no orphaned QBO_ONLY.
+            excluded = [r for r in ats_rows if (_effective_date(r) or clip_start) < clip_start]
+            coverage["clip_start"] = clip_start.isoformat()
+            coverage["excluded_ats_count"] = len(excluded)
+            coverage["excluded_ats_total"] = round(sum(r.gross_sales_amount for r in excluded), 2)
+            ats_rows = [r for r in ats_rows if (_effective_date(r) or clip_start) >= clip_start]
+            qbo_rows = [r for r in qbo_rows if (_effective_date(r) or clip_start) >= clip_start]
+            log(f"  coverage clip: reconciling from {clip_start} onward "
+                f"(QBO booked from {qbo_min}, Bullhorn from {ats_min}); "
+                f"excluded {coverage['excluded_ats_count']} pre-window Bullhorn charges "
+                f"(${coverage['excluded_ats_total']:,.2f})")
+
     if month:
         before = len(ats_rows)
         ats_rows = _filter_by_month(ats_rows, month)
@@ -303,6 +339,7 @@ def reconcile_entity(entity: str, *, month: str | None = None,
         "entity_label": cfg["label"],
         "period": month or "all",
         "sources": {"qbo": str(qbo_path), "ats": str(ats_path)},
+        "coverage": coverage,
         "summary": {
             "qbo_total": round(sum(r.qbo_amount or 0 for r in reconciled), 2),
             "ats_total": round(sum(r.ats_amount or 0 for r in reconciled), 2),

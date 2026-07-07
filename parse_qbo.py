@@ -44,7 +44,7 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "num":      ("num",),
     "customer": ("name", "customer"),
     "description": ("description",),
-    "account":  ("full name", "distribution account"),
+    "account":  ("full name", "account name", "distribution account"),
     "split":    ("item split account",),    # OTS only; missing in CTS template
     "product":  ("product/service",),        # CTS only; drives CPL2 sign rule
     "amount":   ("amount",),
@@ -201,13 +201,21 @@ def load_qbo(path: Path, header_row: int = DEFAULT_HEADER_ROW,
     ws = wb[wb.sheetnames[0]]
 
     cols = _resolve_columns(ws, header_row)
-    required = ("date", "description", "amount")
+    # `account` is required: it drives Employee Advance sign-correction and the
+    # P&L / account-breakdown tiles. A silent blank account (e.g. from a header
+    # rename like "Full name" -> "Account Name") corrupts the reconciliation
+    # math without any error, so we fail loudly instead. If QBO renames this
+    # column again, add the new header to COLUMN_ALIASES["account"] above.
+    required = ("date", "description", "amount", "account")
     missing = [k for k in required if k not in cols]
     if missing:
+        header_vals = [str(c).strip() if c else "" for c in
+                       next(iter(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True)), ())]
         wb.close()
         raise ValueError(
-            f"QBO file {path.name!r} header row {header_row} missing required "
-            f"columns {missing}. Got: {sorted(cols)}"
+            f"QBO file {path.name!r} header row {header_row} is missing required "
+            f"column(s) {missing}. Actual headers found: {header_vals}. "
+            f"If a column was renamed, add its new name to COLUMN_ALIASES in parse_qbo.py."
         )
 
     rows: list[QBORow] = []
