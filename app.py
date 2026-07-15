@@ -100,6 +100,12 @@ PL_REVENUE_PREFIXES: dict[str, list[str]] = {
 # billing cycle straddles month-ends; CTS bills clean Sundays with no cutoff.
 ENTITIES_WITH_DEFERRAL = {"ots"}
 
+# Description substrings that disqualify a line from the period-end deferral.
+# Direct Hire fees are one-time placement fees, not recurring weekly billing,
+# so they don't follow the service-week cutoff even when booked in the window.
+# Case-insensitive. Add more patterns here if other one-off charge types surface.
+DEFERRAL_EXCLUDE_DESC = ("direct hire",)
+
 
 # -------------------------- date helpers --------------------------
 
@@ -261,6 +267,11 @@ def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tu
                 continue
             acct = (q.get("account") or "").strip()
             if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+                continue
+            # Exclude one-off charge types (e.g. Direct Hire placement fees) —
+            # they don't follow the service-week deferral even when in-window.
+            desc_l = (q.get("description") or "").lower()
+            if any(p in desc_l for p in DEFERRAL_EXCLUDE_DESC):
                 continue
             try:
                 dt = date.fromisoformat(d)
