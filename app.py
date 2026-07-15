@@ -113,8 +113,9 @@ DEFERRAL_EXCLUDE_DESC = ("direct hire",)
 # Add a tuple here to flush another Product/Service code.
 FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
     "cts": [
-        ("CPL2 (flush account)", "CPL2"),
-        ("Per Diem (flush account)", "Per Diem"),
+        ("CPL2 (flush account)", "CPL2"),         # -> Interco Rec-OTS
+        ("Per Diem (flush account)", "Per Diem"),  # -> Employee Advance
+        ("Expense/EXP (flush account)", "EXP"),    # -> Employee Advance
     ],
 }
 
@@ -228,6 +229,16 @@ def save_close_log(log: dict) -> None:
 
 # -------------------------- rendering --------------------------
 
+def _qbo_all(payload: dict) -> list[dict]:
+    """The unclipped QBO line set for P&L/flush/deferral reporting. Falls back
+    to reconciled-row lines for older payloads that predate qbo_lines_all."""
+    lines = payload.get("qbo_lines_all")
+    if lines is not None:
+        return lines
+    # Backward-compat: flatten from reconciled rows (clipped) if needed.
+    return [q for row in payload.get("rows", []) for q in row.get("qbo_lines", [])]
+
+
 def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> float:
     """Sum every QBO line whose Transaction Date is in `month` (YYYY-MM) AND
     whose account starts with one of `revenue_prefixes`. Matches what shows
@@ -237,23 +248,21 @@ def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> 
     Empty `revenue_prefixes` list = no account filter (gross sum).
     `month=None` = no date filter (all months).
 
-    Differs from the QBO Revenue (recon) tile because:
-    1. Account filter excludes non-revenue accounts (Employee Advance etc.)
-    2. Date filter is transaction date (P&L month), not the parsed
-       service-week date the reconciliation uses.
+    Reads the UNCLIPPED QBO line set: revenue reporting must include every
+    booked line (e.g. a June credit memo for an old service week that the
+    reconciliation coverage clip drops).
     """
     total = 0.0
-    for row in payload.get("rows", []):
-        for q in row.get("qbo_lines", []):
-            d = q.get("txn_date")
-            if not d:
-                continue
-            if month is not None and not d.startswith(month):
-                continue
-            acct = (q.get("account") or "").strip()
-            if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
-                continue
-            total += q.get("amount") or 0.0
+    for q in _qbo_all(payload):
+        d = q.get("txn_date")
+        if not d:
+            continue
+        if month is not None and not d.startswith(month):
+            continue
+        acct = (q.get("account") or "").strip()
+        if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+            continue
+        total += q.get("amount") or 0.0
     return round(total, 2)
 
 
@@ -272,35 +281,34 @@ def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tu
     contractor it belongs to and its anchor month.
     """
     items: list[dict] = []
-    for row in payload.get("rows", []):
-        for q in row.get("qbo_lines", []):
-            d = q.get("txn_date")
-            if not d or not d.startswith(month):
-                continue
-            acct = (q.get("account") or "").strip()
-            if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
-                continue
-            # Exclude one-off charge types (e.g. Direct Hire placement fees) —
-            # they don't follow the service-week deferral even when in-window.
-            desc_l = (q.get("description") or "").lower()
-            if any(p in desc_l for p in DEFERRAL_EXCLUDE_DESC):
-                continue
-            try:
-                dt = date.fromisoformat(d)
-            except (TypeError, ValueError):
-                continue
-            anchor = to_period_anchor(dt)
-            if (anchor.year, anchor.month) > (dt.year, dt.month):
-                items.append({
-                    "contractor": row.get("contractor", ""),
-                    "txn_date": d,
-                    "num": q.get("num", ""),
-                    "customer": q.get("customer", ""),
-                    "account": acct,
-                    "amount": q.get("amount", 0.0),
-                    "anchor_month": f"{anchor.year:04d}-{anchor.month:02d}",
-                    "description": q.get("description", ""),
-                })
+    for q in _qbo_all(payload):
+        d = q.get("txn_date")
+        if not d or not d.startswith(month):
+            continue
+        acct = (q.get("account") or "").strip()
+        if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+            continue
+        # Exclude one-off charge types (e.g. Direct Hire placement fees) —
+        # they don't follow the service-week deferral even when in-window.
+        desc_l = (q.get("description") or "").lower()
+        if any(p in desc_l for p in DEFERRAL_EXCLUDE_DESC):
+            continue
+        try:
+            dt = date.fromisoformat(d)
+        except (TypeError, ValueError):
+            continue
+        anchor = to_period_anchor(dt)
+        if (anchor.year, anchor.month) > (dt.year, dt.month):
+            items.append({
+                "contractor": q.get("contractor", ""),
+                "txn_date": d,
+                "num": q.get("num", ""),
+                "customer": q.get("customer", ""),
+                "account": acct,
+                "amount": q.get("amount", 0.0),
+                "anchor_month": f"{anchor.year:04d}-{anchor.month:02d}",
+                "description": q.get("description", ""),
+            })
     total = round(sum(i["amount"] for i in items), 2)
     return items, total
 
@@ -310,21 +318,20 @@ def flush_lines(payload: dict, month: str, product_code: str) -> tuple[list[dict
     Date in `month`. These post to a flush account, not P&L revenue.
     Returns (items, total)."""
     items: list[dict] = []
-    for row in payload.get("rows", []):
-        for q in row.get("qbo_lines", []):
-            if (q.get("product") or "").strip().upper() != product_code.upper():
-                continue
-            d = q.get("txn_date")
-            if not d or not d.startswith(month):
-                continue
-            items.append({
-                "contractor": row.get("contractor", ""),
-                "txn_date": d,
-                "num": q.get("num", ""),
-                "customer": q.get("customer", ""),
-                "amount": q.get("amount", 0.0),
-                "description": q.get("description", ""),
-            })
+    for q in _qbo_all(payload):
+        if (q.get("product") or "").strip().upper() != product_code.upper():
+            continue
+        d = q.get("txn_date")
+        if not d or not d.startswith(month):
+            continue
+        items.append({
+            "contractor": q.get("contractor", ""),
+            "txn_date": d,
+            "num": q.get("num", ""),
+            "customer": q.get("customer", ""),
+            "amount": q.get("amount", 0.0),
+            "description": q.get("description", ""),
+        })
     total = round(sum(i["amount"] for i in items), 2)
     return items, total
 

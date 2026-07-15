@@ -114,6 +114,35 @@ def _filter_by_month(rows, month: str | None):
     return out
 
 
+def _qbo_contractor(desc: str) -> str:
+    """Best-effort contractor name from a QBO description like
+    '58363, Angela Hardin - Expense - 2026-04-03' -> 'Angela Hardin'."""
+    if not desc:
+        return ""
+    after = desc.split(",", 1)[1] if "," in desc else desc
+    return after.split(" - ", 1)[0].strip()
+
+
+def _qbo_line_to_json(q) -> dict:
+    """Flat serialization of a single QBORow — used for the unclipped
+    qbo_lines_all set that drives P&L/flush/deferral reporting (which must be
+    independent of the reconciliation coverage clip)."""
+    return {
+        "row": q.row_num,
+        "txn_date": q.txn_date.isoformat() if q.txn_date else None,
+        "parsed_date": q.parsed_date.isoformat() if q.parsed_date else None,
+        "txn_type": q.txn_type,
+        "num": q.num,
+        "customer": q.customer,
+        "contractor": _qbo_contractor(q.description),
+        "description": q.description,
+        "account": q.account,
+        "split_account": q.split_account,
+        "product": q.product,
+        "amount": q.amount,
+    }
+
+
 def _row_to_json(r: ReconciledRow) -> dict:
     return {
         "key": r.key,
@@ -277,6 +306,14 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(ats_rows)} rows")
 
+    # Capture the FULL, unclipped QBO line set now — before the coverage clip.
+    # P&L / Book Revenue / flush / deferral reporting keys off transaction date
+    # and account/product, and must include every booked line (e.g. a June
+    # credit memo for an old service week that the matching clip would drop).
+    # Reconciliation (matching, exceptions) uses the clipped rows; revenue
+    # reporting uses this.
+    qbo_lines_all = [_qbo_line_to_json(r) for r in qbo_rows]
+
     # --- Coverage clip -------------------------------------------------------
     # You can only reconcile where QBO has data. When the QBO export starts
     # later than the Bullhorn export (a common export-window drift), the older
@@ -348,6 +385,7 @@ def reconcile_entity(entity: str, *, month: str | None = None,
             "actionable_exceptions": actionable_count,
         },
         "rows": [_row_to_json(r) for r in reconciled],
+        "qbo_lines_all": qbo_lines_all,  # unclipped; drives P&L/flush/deferral reporting
         "_reconciled": reconciled,  # held for in-process snapshot generation; not serialized
     }
 
