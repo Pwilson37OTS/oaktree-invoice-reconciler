@@ -106,12 +106,17 @@ ENTITIES_WITH_DEFERRAL = {"ots"}
 # Case-insensitive. Add more patterns here if other one-off charge types surface.
 DEFERRAL_EXCLUDE_DESC = ("direct hire",)
 
-# Entities + Product/Service code for the "flush account" adjustment. These
-# lines post to a balance-sheet flush account, NOT P&L revenue, so they inflate
-# the QBO revenue figure. Month Close shows their total and a "Book Revenue"
-# (revenue net of the flush) for these entities.
-ENTITIES_WITH_CPL2_FLUSH = {"cts"}
-CPL2_PRODUCT_CODE = "CPL2"
+# Product/Service codes that post to flush accounts (balance-sheet clearing or
+# expense flush), NOT P&L revenue — so they inflate the QBO revenue figure.
+# Month Close shows each flush total and a "Book Revenue" (revenue net of all
+# flush lines). Per-entity list of (display label, exact Product/Service code).
+# Add a tuple here to flush another Product/Service code.
+FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
+    "cts": [
+        ("CPL2 (flush account)", "CPL2"),
+        ("Per Diem (flush account)", "Per Diem"),
+    ],
+}
 
 
 # -------------------------- date helpers --------------------------
@@ -300,14 +305,14 @@ def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tu
     return items, total
 
 
-def cpl2_lines(payload: dict, month: str) -> tuple[list[dict], float]:
-    """All QBO lines with Product/Service == CPL2_PRODUCT_CODE and a
-    Transaction Date in `month`. These post to a balance-sheet flush account,
-    not P&L revenue. Returns (items, total)."""
+def flush_lines(payload: dict, month: str, product_code: str) -> tuple[list[dict], float]:
+    """All QBO lines with Product/Service == product_code and a Transaction
+    Date in `month`. These post to a flush account, not P&L revenue.
+    Returns (items, total)."""
     items: list[dict] = []
     for row in payload.get("rows", []):
         for q in row.get("qbo_lines", []):
-            if (q.get("product") or "").strip().upper() != CPL2_PRODUCT_CODE.upper():
+            if (q.get("product") or "").strip().upper() != product_code.upper():
                 continue
             d = q.get("txn_date")
             if not d or not d.startswith(month):
@@ -569,29 +574,50 @@ def page_continuous(payload: dict, df: pd.DataFrame, entity: str) -> None:
     render_drill_down(filtered, payload, prefix=f"{entity}_cont")
 
 
-def render_cpl2_section(payload: dict, month: str, entity: str) -> None:
-    """CTS flush-account adjustment: CPL2 lines post to a balance-sheet flush
-    account, not P&L revenue, so they inflate the QBO revenue figure. Show the
-    CPL2 total and a Book Revenue (revenue net of CPL2)."""
-    if entity not in ENTITIES_WITH_CPL2_FLUSH:
+def render_flush_section(payload: dict, month: str, entity: str) -> None:
+    """Flush-account adjustment: certain Product/Service codes (CPL2, Per Diem)
+    post to flush accounts (balance sheet / expense), not P&L revenue, so they
+    inflate the QBO revenue figure. Show each flush total and a Book Revenue
+    (revenue net of all flush lines)."""
+    flush_cfg = FLUSH_PRODUCTS.get(entity)
+    if not flush_cfg:
         return
 
     revenue_prefixes = PL_REVENUE_PREFIXES.get(entity, [])
-    gross = _pl_total(payload, month, revenue_prefixes)  # revenue as booked (incl. CPL2)
-    items, cpl2 = cpl2_lines(payload, month)
-    book = round(gross - cpl2, 2)
+    gross = _pl_total(payload, month, revenue_prefixes)  # revenue as booked (incl. flush)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Revenue (as booked)", f"${gross:,.2f}",
-              help="QBO revenue booked by Transaction Date, including CPL2 flush lines.")
-    c2.metric(f"CPL2 (flush account)", f"${cpl2:,.2f}",
-              help="Lines with Product/Service = CPL2. These post to a balance-sheet "
-                   "flush account, not P&L revenue, so they're removed from Book Revenue.")
-    c3.metric("Book Revenue", f"${book:,.2f}",
-              help="Revenue as booked minus CPL2 flush lines = what hits the P&L.")
+    results = []  # (label, code, items, total)
+    total_flush = 0.0
+    for label, code in flush_cfg:
+        items, total = flush_lines(payload, month, code)
+        results.append((label, code, items, total))
+        total_flush = round(total_flush + total, 2)
+    book = round(gross - total_flush, 2)
 
-    if items:
-        with st.expander(f"Show the {len(items)} CPL2 line(s) in {month}", expanded=False):
+    st.markdown("### Book revenue (flush-account adjustment)")
+
+    # Headline tiles: Revenue as booked + one per flush code, chunked 3/row so
+    # large numbers don't get truncated on narrow screens.
+    tiles = [("Revenue (as booked)", f"${gross:,.2f}",
+              "QBO revenue booked by Transaction Date, including flush lines.")]
+    for label, code, items, total in results:
+        tiles.append((label, f"${total:,.2f}",
+                      f"Lines with Product/Service = {code}. These post to a flush "
+                      f"account, not P&L revenue, so they're removed from Book Revenue."))
+    for start in range(0, len(tiles), 3):
+        row = tiles[start:start + 3]
+        cols = st.columns(3)
+        for col, (lbl, val, help_txt) in zip(cols, row):
+            col.metric(lbl, val, help=help_txt)
+
+    st.metric("Book Revenue", f"${book:,.2f}",
+              help="Revenue as booked minus all flush lines = what hits the P&L.")
+
+    # Per-code line-item detail for verification.
+    for label, code, items, total in results:
+        if not items:
+            continue
+        with st.expander(f"Show the {len(items)} {code} line(s) in {month} — ${total:,.2f}", expanded=False):
             cdf = pd.DataFrame(items)[
                 ["contractor", "txn_date", "num", "customer", "amount", "description"]
             ].rename(columns={
@@ -599,7 +625,7 @@ def render_cpl2_section(payload: dict, month: str, entity: str) -> None:
                 "customer": "Customer", "amount": "Amount", "description": "Description",
             })
             styled = cdf.style.format({"Amount": lambda v: f"${v:,.2f}"})
-            st.dataframe(styled, hide_index=True, width="stretch", height=320)
+            st.dataframe(styled, hide_index=True, width="stretch", height=280)
 
 
 def render_deferral_section(payload: dict, month: str, entity: str) -> None:
@@ -676,7 +702,7 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
 
     render_tiles(sub, payload=payload, entity=entity, pl_month=month)
 
-    render_cpl2_section(payload, month, entity)
+    render_flush_section(payload, month, entity)
 
     render_deferral_section(payload, month, entity)
 
