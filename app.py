@@ -119,6 +119,19 @@ FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# Entities that get the service-week accrual section in Month Close. CTS bills
+# bi-weekly, so a single invoice booked in one month can carry a line whose
+# service week falls in the adjacent month — that line's revenue needs to be
+# accrued to the month it was earned.
+ENTITIES_WITH_ACCRUAL = {"cts"}
+
+# Revenue (P&L) account prefixes per entity — used to scope the accrual to
+# actual revenue lines (excludes flush/clearing accounts).
+REVENUE_ACCOUNT_PREFIXES = {
+    "ots": ["Primary Sales"],
+    "cts": ["Revenue-Sales", "Revenue-Placement"],
+}
+
 
 # -------------------------- date helpers --------------------------
 
@@ -270,6 +283,57 @@ def _next_month_label(month: str) -> str:
     """'2026-05' -> '2026-06'."""
     y, m = int(month[:4]), int(month[5:7])
     return f"{y + 1:04d}-01" if m == 12 else f"{y:04d}-{m + 1:02d}"
+
+
+def _prev_month_label(month: str) -> str:
+    """'2026-06' -> '2026-05'."""
+    y, m = int(month[:4]), int(month[5:7])
+    return f"{y - 1:04d}-12" if m == 1 else f"{y:04d}-{m - 1:02d}"
+
+
+def accrual_items(payload: dict, month: str, revenue_prefixes: list[str],
+                  direction: str) -> tuple[list[dict], float]:
+    """Revenue lines whose service-week month and booking (txn) month differ
+    across an adjacent month boundary — the bi-weekly straddle.
+
+    direction="back": booked (txn) in `month`, service week in the PRIOR month
+                      -> revenue to accrue OUT of `month` back to prior month.
+    direction="in":   service week in `month`, booked (txn) in the NEXT month
+                      -> revenue earned in `month` to accrue IN from next month.
+
+    Restricted to revenue accounts; Direct Hire (one-off, no weekly service
+    week) is excluded.
+    """
+    if direction == "back":
+        txn_m, svc_m = month, _prev_month_label(month)
+    elif direction == "in":
+        txn_m, svc_m = _next_month_label(month), month
+    else:
+        raise ValueError(direction)
+
+    items: list[dict] = []
+    for q in _qbo_all(payload):
+        txn, parsed = q.get("txn_date"), q.get("parsed_date")
+        if not txn or not parsed:
+            continue
+        if not (txn.startswith(txn_m) and parsed.startswith(svc_m)):
+            continue
+        acct = (q.get("account") or "").strip()
+        if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
+            continue
+        if any(p in (q.get("description") or "").lower() for p in DEFERRAL_EXCLUDE_DESC):
+            continue
+        items.append({
+            "contractor": q.get("contractor", ""),
+            "invoice_num": q.get("num", ""),
+            "booked": txn,
+            "service_week": parsed,
+            "customer": q.get("customer", ""),
+            "amount": q.get("amount", 0.0),
+            "description": q.get("description", ""),
+        })
+    total = round(sum(i["amount"] for i in items), 2)
+    return items, total
 
 
 def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tuple[list[dict], float]:
@@ -635,6 +699,71 @@ def render_flush_section(payload: dict, month: str, entity: str) -> None:
             st.dataframe(styled, hide_index=True, width="stretch", height=280)
 
 
+def _accrual_detail_df(items: list[dict]) -> "pd.DataFrame":
+    return pd.DataFrame(items)[
+        ["contractor", "invoice_num", "booked", "service_week", "customer", "amount", "description"]
+    ].rename(columns={
+        "contractor": "Contractor", "invoice_num": "Invoice #", "booked": "Booked (txn)",
+        "service_week": "Service week", "customer": "Customer", "amount": "Amount",
+        "description": "Description",
+    })
+
+
+def render_accrual_section(payload: dict, month: str, entity: str) -> None:
+    """Service-week accrual for bi-weekly invoices straddling a month boundary.
+    Accrue-back: booked this month, earned last month -> move OUT to prior month.
+    Accrue-in:   earned this month, booked next month -> move IN from next month."""
+    if entity not in ENTITIES_WITH_ACCRUAL:
+        return
+
+    rev = REVENUE_ACCOUNT_PREFIXES.get(entity, [])
+    prev_m, next_m = _prev_month_label(month), _next_month_label(month)
+    back_items, back_total = accrual_items(payload, month, rev, "back")
+    in_items, in_total = accrual_items(payload, month, rev, "in")
+
+    if not back_items and not in_items:
+        return
+
+    st.markdown("### Accruals (bi-weekly service-week timing)")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"Accrue back → {prev_m}", f"${back_total:,.2f}",
+              help=f"Revenue lines booked in {month} whose service week is in {prev_m}. "
+                   f"Move this OUT of {month} into {prev_m}.")
+    c2.metric(f"Accrue in ← {next_m}", f"${in_total:,.2f}",
+              help=f"Revenue lines earned in {month} (service week) but booked in {next_m}. "
+                   f"Move this INTO {month}. May be incomplete until {next_m} is fully booked.")
+    net = round(in_total - back_total, 2)
+    c3.metric(f"Net accrual to {month}", f"${net:,.2f}",
+              help=f"Accrue-in minus accrue-out. Positive = {month} revenue rises on a "
+                   f"service-week basis; negative = it falls.")
+
+    st.caption(
+        f"{len(back_items)} line(s) booked in {month} belong to {prev_m}; "
+        f"{len(in_items)} line(s) earned in {month} were booked in {next_m}. "
+        f"These are bi-weekly invoices whose two weeks straddle the month boundary."
+    )
+
+    if back_items:
+        with st.expander(f"Accrue back to {prev_m} — {len(back_items)} line(s), ${back_total:,.2f}", expanded=False):
+            df = _accrual_detail_df(back_items)
+            st.dataframe(df.style.format({"Amount": lambda v: f"${v:,.2f}"}),
+                         hide_index=True, width="stretch", height=280)
+            st.download_button(f"Download — {entity}_{month}_accrue_back.csv",
+                               data=df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"{entity}_{month}_accrue_back_to_{prev_m}.csv",
+                               mime="text/csv", key=f"{entity}_{month}_accr_back_dl")
+    if in_items:
+        with st.expander(f"Accrue in from {next_m} — {len(in_items)} line(s), ${in_total:,.2f}", expanded=False):
+            df = _accrual_detail_df(in_items)
+            st.dataframe(df.style.format({"Amount": lambda v: f"${v:,.2f}"}),
+                         hide_index=True, width="stretch", height=280)
+            st.download_button(f"Download — {entity}_{month}_accrue_in.csv",
+                               data=df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"{entity}_{month}_accrue_in_from_{next_m}.csv",
+                               mime="text/csv", key=f"{entity}_{month}_accr_in_dl")
+
+
 def render_deferral_section(payload: dict, month: str, entity: str) -> None:
     """Show the period-end deferral: revenue invoices booked this month that
     belong (per accounting cutoff) to next month, so finance can book the JE."""
@@ -710,6 +839,8 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
     render_tiles(sub, payload=payload, entity=entity, pl_month=month)
 
     render_flush_section(payload, month, entity)
+
+    render_accrual_section(payload, month, entity)
 
     render_deferral_section(payload, month, entity)
 
