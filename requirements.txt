@@ -1,3 +1,8 @@
-streamlit>=1.40
-pandas>=2.2
-openpyxl>=3.1
+# Pinned to the versions verified locally. Unpinned ">=" let Streamlit Cloud
+# pull a newer Streamlit on redeploy than the code was written against, which
+# can break render calls (this caused the "Error running app" crash).
+# streamlit is pinned exactly; pandas/openpyxl are bounded below the next major
+# so they stay installable across the cloud's Python version.
+streamlit==1.56.0
+pandas>=2.2,<3.1
+openpyxl>=3.1,<4
