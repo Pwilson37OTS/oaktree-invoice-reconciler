@@ -291,15 +291,38 @@ def _prev_month_label(month: str) -> str:
     return f"{y - 1:04d}-12" if m == 1 else f"{y:04d}-{m - 1:02d}"
 
 
+def _service_period(week_ending_iso: str) -> str | None:
+    """Accounting month a CTS service week belongs to = calendar month of that
+    week's ENDING SUNDAY.
+
+    CTS weeks run Mon-Sun; different clients report the week ending on Fri, Sat,
+    or Sun, but they're all the same billing week and roll up to that week's
+    Sunday. So a week ending Fri 2026-07-31 belongs to the week ending Sun
+    2026-08-02 -> August, NOT July. Using the raw ending date's calendar month
+    would wrongly place it in July.
+    """
+    try:
+        d = date.fromisoformat(week_ending_iso)
+    except (TypeError, ValueError):
+        return None
+    sunday = d + timedelta(days=(6 - d.weekday()))  # Mon=0..Sun=6; next Sun on/after d
+    return f"{sunday.year:04d}-{sunday.month:02d}"
+
+
 def accrual_items(payload: dict, month: str, revenue_prefixes: list[str],
                   direction: str) -> tuple[list[dict], float]:
     """Revenue lines whose service-week month and booking (txn) month differ
     across an adjacent month boundary — the bi-weekly straddle.
 
-    direction="back": booked (txn) in `month`, service week in the PRIOR month
-                      -> revenue to accrue OUT of `month` back to prior month.
-    direction="in":   service week in `month`, booked (txn) in the NEXT month
-                      -> revenue earned in `month` to accrue IN from next month.
+    direction="back": booked (txn) in `month`, service week EARNED in the PRIOR
+                      month -> revenue to accrue OUT of `month` back to prior.
+    direction="in":   service week EARNED in `month`, booked (txn) in the NEXT
+                      month -> revenue earned in `month` to accrue IN.
+
+    A service week's earned month is the calendar month of its week-ending
+    SUNDAY (see _service_period) — NOT the raw week-ending date's month — so a
+    week ending Fri 7/31 counts as August, not July. Booking month is the
+    txn_date calendar month (CTS booking dates are correct in QBO as-is).
 
     Restricted to revenue accounts; Direct Hire (one-off, no weekly service
     week) is excluded.
@@ -316,7 +339,7 @@ def accrual_items(payload: dict, month: str, revenue_prefixes: list[str],
         txn, parsed = q.get("txn_date"), q.get("parsed_date")
         if not txn or not parsed:
             continue
-        if not (txn.startswith(txn_m) and parsed.startswith(svc_m)):
+        if not txn.startswith(txn_m) or _service_period(parsed) != svc_m:
             continue
         acct = (q.get("account") or "").strip()
         if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
