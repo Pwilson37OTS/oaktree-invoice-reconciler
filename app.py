@@ -740,6 +740,27 @@ def render_flush_section(payload: dict, month: str, entity: str) -> None:
             st.dataframe(styled, hide_index=True, width="stretch", height=280)
 
 
+def render_book_revenue(payload: dict, month: str, entity: str) -> None:
+    """Headline book-revenue number for entities WITHOUT a flush section (OTS).
+    CTS shows its Book Revenue inside the flush section instead. This makes the
+    single figure-to-book unambiguous, separate from the reconciliation tiles."""
+    if entity in FLUSH_PRODUCTS:
+        return  # CTS: Book Revenue is shown in the flush-account section
+    prefixes = PL_REVENUE_PREFIXES.get(entity)
+    if not prefixes:
+        return
+    book = _pl_total(payload, month, prefixes)
+    st.markdown("### Book revenue")
+    st.metric(f"Book Revenue — {month}", f"${book:,.2f}",
+              help=("Revenue-account (Primary Sales) lines booked in QBO with a "
+                    f"{month} transaction date — the amount to book to the P&L for "
+                    f"{month}. The 'QBO revenue (recon)' and 'Bullhorn billed' tiles "
+                    "above are reconciliation totals (they include Employee Advance / "
+                    "Employee Wages pass-throughs and use the service-week accounting "
+                    "bucket to match Bullhorn line-for-line), so they are intentionally "
+                    "larger and are NOT the figure to book."))
+
+
 def _accrual_detail_df(items: list[dict]) -> "pd.DataFrame":
     return pd.DataFrame(items)[
         ["contractor", "invoice_num", "booked", "service_week", "customer", "amount", "description"]
@@ -878,6 +899,8 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
         )
 
     render_tiles(sub, payload=payload, entity=entity, pl_month=month)
+
+    render_book_revenue(payload, month, entity)
 
     render_flush_section(payload, month, entity)
 
