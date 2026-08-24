@@ -122,7 +122,7 @@ FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
 # Entities that get the service-week accrual section in Month Close. CTS bills
 # bi-weekly, so a single invoice booked in one month can carry a line whose
 # service week falls in the adjacent month — that line's revenue needs to be
-# accrued to the month it was earned.
+# accrued to the month it was earned. (Uses the week-ending-Sunday rule.)
 ENTITIES_WITH_ACCRUAL = {"cts"}
 
 # Revenue (P&L) account prefixes per entity — used to scope the accrual to
@@ -152,13 +152,31 @@ def _week_label(week_start):
 
 # -------------------------- data layer --------------------------
 
+def _accounting_month(d: date, entity: str) -> str:
+    """Which close-period month a billing date belongs to.
+
+    OTS assigns billing weeks to accounting months via the period_calendar
+    cutoffs (e.g. 8/1-8/2 belong to July, 5/28-31 belong to June), so we bucket
+    OTS by the anchor month — not the raw calendar month, which would split a
+    billing week across two closes. Other entities bucket by raw month.
+    NOTE: this only affects which month a row is *displayed* under; the deferral
+    JE figure is computed separately from the raw QBO transaction lines and is
+    unaffected by this bucketing.
+    """
+    if entity in ENTITIES_WITH_DEFERRAL:  # OTS = period_calendar entities
+        a = to_period_anchor(d)
+        return f"{a.year:04d}-{a.month:02d}"
+    return f"{d.year:04d}-{d.month:02d}"
+
+
 def frame_payload(payload: dict) -> pd.DataFrame:
     """Convert the JSON `rows` list into a DataFrame with helper columns."""
     rows = payload.get("rows", [])
     df = pd.DataFrame(rows)
     if not df.empty:
+        entity = payload.get("entity", "")
         df["billing_date"] = pd.to_datetime(df["billing_date"]).dt.date
-        df["month"] = df["billing_date"].apply(lambda d: f"{d.year:04d}-{d.month:02d}")
+        df["month"] = df["billing_date"].apply(lambda d: _accounting_month(d, entity))
         df["week_start"] = df["billing_date"].apply(_week_start)
         df["week_label"] = df["week_start"].apply(_week_label)
         df["qbo_amount"] = df["qbo_amount"].astype("float64")
