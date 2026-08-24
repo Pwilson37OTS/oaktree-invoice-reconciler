@@ -125,6 +125,22 @@ FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
 # accrued to the month it was earned. (Uses the week-ending-Sunday rule.)
 ENTITIES_WITH_ACCRUAL = {"cts"}
 
+# A handful of OTS contractors bill on a biweekly rotation, invoiced on TUESDAYS
+# (everyone else bills Sun/Fri/Sat). Because their Tuesday cadence drifts against
+# the Friday-based payroll-period months, some of their invoices are booked one
+# calendar month but the work belongs to the prior payroll month and must be
+# accrued back. The payroll month = period_calendar anchor of the work-week
+# Sunday (the Tuesday's most-recent Sunday). Scoped to these candidate IDs so
+# ordinary Tuesday items (Direct Hire, recon JEs) are not swept in. Update this
+# set if the biweekly-Tuesday roster changes.
+TUESDAY_ACCRUAL_IDS = {
+    "144241",  # Jose Guerrero
+    "144242",  # Luis Reyes
+    "145471",  # Jesus Salgado
+    "195326",  # Randall Hinojos
+}
+ENTITIES_WITH_TUESDAY_ACCRUAL = {"ots"}
+
 # Revenue (P&L) account prefixes per entity — used to scope the accrual to
 # actual revenue lines (excludes flush/clearing accounts).
 REVENUE_ACCOUNT_PREFIXES = {
@@ -412,6 +428,58 @@ def deferral_items(payload: dict, month: str, revenue_prefixes: list[str]) -> tu
                 "account": acct,
                 "amount": q.get("amount", 0.0),
                 "anchor_month": f"{anchor.year:04d}-{anchor.month:02d}",
+                "description": q.get("description", ""),
+            })
+    total = round(sum(i["amount"] for i in items), 2)
+    return items, total
+
+
+def _payroll_month_for_tuesday(txn_iso: str) -> str | None:
+    """Payroll-period month for a Tuesday-billed biweekly invoice = the
+    period_calendar accounting month of that invoice's work-week Sunday (the
+    most recent Sunday on/before the bill date). E.g. billed Tue 8/4 -> work-week
+    Sunday 8/2 -> period_calendar anchor 7/31 -> July."""
+    try:
+        d = date.fromisoformat(txn_iso)
+    except (TypeError, ValueError):
+        return None
+    work_sunday = d - timedelta(days=(d.weekday() + 1) % 7)  # most recent Sun <= d
+    anchor = to_period_anchor(work_sunday)
+    return f"{anchor.year:04d}-{anchor.month:02d}"
+
+
+def tuesday_accrual_items(payload: dict, month: str, direction: str) -> tuple[list[dict], float]:
+    """Biweekly Tuesday-billed contractor invoices whose payroll month differs
+    from their booked (txn) month.
+
+    direction="back": booked (txn) in `month`, payroll month EARLIER -> accrue
+                      the invoice OUT of `month` back to the payroll month.
+    direction="in":   payroll month IS `month`, booked (txn) in a later month ->
+                      accrue the invoice IN to `month`.
+    """
+    items: list[dict] = []
+    for q in _qbo_all(payload):
+        if q.get("candidate_id") not in TUESDAY_ACCRUAL_IDS:
+            continue
+        if not (q.get("account") or "").startswith("Primary Sales"):
+            continue
+        tx = q.get("txn_date")
+        if not tx:
+            continue
+        booked_m = tx[:7]
+        payroll_m = _payroll_month_for_tuesday(tx)
+        if not payroll_m or payroll_m == booked_m:
+            continue  # aligned — no accrual
+        keep = (booked_m == month and payroll_m < month) if direction == "back" else \
+               (payroll_m == month and booked_m != month)
+        if keep:
+            items.append({
+                "contractor": q.get("contractor", ""),
+                "invoice_num": q.get("num", ""),
+                "booked": tx,
+                "payroll_month": payroll_m,
+                "customer": q.get("customer", ""),
+                "amount": q.get("amount", 0.0),
                 "description": q.get("description", ""),
             })
     total = round(sum(i["amount"] for i in items), 2)
@@ -740,6 +808,57 @@ def render_flush_section(payload: dict, month: str, entity: str) -> None:
             st.dataframe(styled, hide_index=True, width="stretch", height=280)
 
 
+def render_tuesday_accrual_section(payload: dict, month: str, entity: str) -> None:
+    """Separate OTS block for the biweekly Tuesday-billed contractors whose
+    invoices straddle the payroll-period-month boundary."""
+    if entity not in ENTITIES_WITH_TUESDAY_ACCRUAL:
+        return
+
+    back_items, back_total = tuesday_accrual_items(payload, month, "back")
+    in_items, in_total = tuesday_accrual_items(payload, month, "in")
+    if not back_items and not in_items:
+        return
+
+    prev_m, next_m = _prev_month_label(month), _next_month_label(month)
+    st.markdown("### Biweekly Tuesday-billed accrual")
+    st.caption(
+        "The 4 biweekly contractors invoiced on Tuesdays (Guerrero, Reyes, "
+        "Salgado, Hinojos). Their Tuesday cadence drifts against the Friday-based "
+        "payroll months, so some invoices are booked one month but the work "
+        "belongs to the adjacent payroll month."
+    )
+
+    c1, c2 = st.columns(2)
+    c1.metric(f"Accrue back → {prev_m}", f"${back_total:,.2f}",
+              help=f"Tuesday invoices booked in {month} whose payroll month is {prev_m}. "
+                   f"Accrue this out of {month} into {prev_m}.")
+    c2.metric(f"Accrue in ← {next_m}", f"${in_total:,.2f}",
+              help=f"Tuesday invoices whose payroll month is {month} but were booked in "
+                   f"{next_m}. Accrue this into {month}.")
+
+    def _tue_df(items):
+        return pd.DataFrame(items)[
+            ["contractor", "invoice_num", "booked", "payroll_month", "amount", "description"]
+        ].rename(columns={
+            "contractor": "Contractor", "invoice_num": "Invoice #", "booked": "Booked (txn)",
+            "payroll_month": "Payroll month", "amount": "Amount", "description": "Description",
+        })
+
+    for label, items, tot, tag in [
+        (f"Accrue back to {prev_m}", back_items, back_total, "back"),
+        (f"Accrue in from {next_m}", in_items, in_total, "in"),
+    ]:
+        if items:
+            with st.expander(f"{label} — {len(items)} invoice(s), ${tot:,.2f}", expanded=(tag == "back")):
+                df = _tue_df(items)
+                st.dataframe(df.style.format({"Amount": lambda v: f"${v:,.2f}"}),
+                             hide_index=True, width="stretch", height=200)
+                st.download_button(f"Download — {entity}_{month}_tuesday_{tag}.csv",
+                                   data=df.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"{entity}_{month}_tuesday_accrual_{tag}.csv",
+                                   mime="text/csv", key=f"{entity}_{month}_tue_{tag}_dl")
+
+
 def render_book_revenue(payload: dict, month: str, entity: str) -> None:
     """Headline book-revenue number for entities WITHOUT a flush section (OTS).
     CTS shows its Book Revenue inside the flush section instead. This makes the
@@ -907,6 +1026,8 @@ def page_month_close(payload: dict, df: pd.DataFrame, entity: str) -> None:
     render_accrual_section(payload, month, entity)
 
     render_deferral_section(payload, month, entity)
+
+    render_tuesday_accrual_section(payload, month, entity)
 
     st.markdown(f"### Reconciled rows — {ENTITIES[entity]['short']} · {month}")
     render_table(sub)

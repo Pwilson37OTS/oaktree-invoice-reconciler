@@ -134,6 +134,7 @@ def _qbo_line_to_json(q) -> dict:
         "txn_type": q.txn_type,
         "num": q.num,
         "customer": q.customer,
+        "candidate_id": q.candidate_id,
         "contractor": _qbo_contractor(q.description),
         "description": q.description,
         "account": q.account,
