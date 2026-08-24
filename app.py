@@ -820,7 +820,7 @@ def render_tuesday_accrual_section(payload: dict, month: str, entity: str) -> No
         return
 
     prev_m, next_m = _prev_month_label(month), _next_month_label(month)
-    st.markdown("### Biweekly Tuesday-billed accrual")
+    st.markdown("### TCOM Accrual")
     st.caption(
         "The 4 biweekly contractors invoiced on Tuesdays (Guerrero, Reyes, "
         "Salgado, Hinojos). Their Tuesday cadence drifts against the Friday-based "
