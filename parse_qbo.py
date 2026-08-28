@@ -147,14 +147,18 @@ def _parse_description(desc: str) -> tuple[str | None, date | None]:
 def _sign_correct(account: str, txn_type: str, product: str, amount: float) -> float:
     """Normalize amount signs so per-key sums net correctly:
 
-    1. Product/Service in SIGN_FLIP_PRODUCTS (e.g. CPL2): always +abs.
-       These are booked outside revenue and post as negatives but should
-       be treated as positive revenue for reconciliation.
+    1. Product/Service in SIGN_FLIP_PRODUCTS (e.g. CPL2): Invoices post as
+       negatives but represent positive value => +abs. Their Credit Memo
+       REVERSALS post as positives and must stay negative so an invoice and
+       its reversal net to zero => -abs. (Without this, credit memos add
+       instead of cancel and inflate the QBO side — e.g. one week showing 5x.)
     2. Employee Advance lines: Credit Memo => -abs, all else => +abs.
        Mirrors the VBA macro's normalization.
     Product rule takes precedence when both apply.
     """
     if product and product.strip().upper() in SIGN_FLIP_PRODUCTS:
+        if (txn_type or "").strip() == "Credit Memo":
+            return -abs(amount)
         return abs(amount)
     if (account or "").strip() == "Employee Advance":
         if (txn_type or "").strip() == "Credit Memo":
