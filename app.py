@@ -286,7 +286,8 @@ def _qbo_all(payload: dict) -> list[dict]:
     return [q for row in payload.get("rows", []) for q in row.get("qbo_lines", [])]
 
 
-def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> float:
+def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str],
+              exclude_types: tuple[str, ...] = ()) -> float:
     """Sum every QBO line whose Transaction Date is in `month` (YYYY-MM) AND
     whose account starts with one of `revenue_prefixes`. Matches what shows
     up on the QBO P&L statement — excludes clearing accounts like Employee
@@ -294,6 +295,8 @@ def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> 
 
     Empty `revenue_prefixes` list = no account filter (gross sum).
     `month=None` = no date filter (all months).
+    `exclude_types` = txn types to skip (e.g. ("Journal Entry",) to drop the
+    manual DEFERRED REV deferral entries from billed revenue).
 
     Reads the UNCLIPPED QBO line set: revenue reporting must include every
     booked line (e.g. a June credit memo for an old service week that the
@@ -306,11 +309,33 @@ def _pl_total(payload: dict, month: str | None, revenue_prefixes: list[str]) -> 
             continue
         if month is not None and not d.startswith(month):
             continue
+        if exclude_types and (q.get("txn_type") or "") in exclude_types:
+            continue
         acct = (q.get("account") or "").strip()
         if revenue_prefixes and not any(acct.startswith(p) for p in revenue_prefixes):
             continue
         total += q.get("amount") or 0.0
     return round(total, 2)
+
+
+# The booked P&L revenue line Phil ties to QuickBooks. OTS = Revenue-Sales only,
+# billed (Invoice + Credit Memo). Revenue-Placement is a SEPARATE P&L income
+# line, and the manual DEFERRED REV journal entries are the deferral adjustment
+# (shown in the deferral section), NOT part of billed revenue. Entities absent
+# here fall back to PL_REVENUE_PREFIXES with no type exclusion.
+BOOK_REVENUE_ACCOUNTS: dict[str, list[str]] = {"ots": ["Primary Sales:Revenue-Sales"]}
+BOOK_REVENUE_EXCLUDE_TYPES: dict[str, tuple[str, ...]] = {"ots": ("Journal Entry",)}
+PLACEMENT_ACCOUNTS: dict[str, list[str]] = {"ots": ["Primary Sales:Revenue-Placement"]}
+
+
+def _book_revenue(payload: dict, month: str | None, entity: str) -> float:
+    """Billed P&L revenue line for `entity` — the figure Phil ties to the QBO
+    P&L revenue line: revenue accounts only, deferral journal entries excluded."""
+    accts = BOOK_REVENUE_ACCOUNTS.get(entity)
+    if accts is None:
+        return _pl_total(payload, month, PL_REVENUE_PREFIXES.get(entity, []))
+    return _pl_total(payload, month, accts,
+                     exclude_types=BOOK_REVENUE_EXCLUDE_TYPES.get(entity, ()))
 
 
 def _next_month_label(month: str) -> str:
@@ -547,14 +572,13 @@ def render_tiles(df: pd.DataFrame, payload: dict | None = None, entity: str | No
                 help="Reconciliation view — buckets each QBO line by its service-week date "
                      "(parsed from the Description). Used for matching against Bullhorn.")
     if payload is not None:
-        revenue_prefixes = PL_REVENUE_PREFIXES.get(entity or "", [])
-        pl = _pl_total(payload, pl_month, revenue_prefixes)
+        pl = _book_revenue(payload, pl_month, entity or "")
         r1c3.metric("QBO P&L (txn date)", f"${pl:,.2f}",
-                    help="P&L view — sums revenue-account QBO lines (Primary Sales for OTS) "
-                        "by their Transaction Date column (when QBO actually booked the entry). "
-                        "Excludes clearing accounts (Employee Advance) and cost accounts "
-                        "(Employee Wages). May differ from QBO recon when Credit Memos for "
-                        "prior-month service weeks are booked in the current month.")
+                    help="P&L view — the billed revenue line (Revenue-Sales invoices net of "
+                        "credit memos for OTS) by Transaction Date. Excludes clearing accounts "
+                        "(Employee Advance), cost accounts (Employee Wages), direct-hire "
+                        "Placement (a separate P&L line), and the DEFERRED REV deferral "
+                        "journal entries (shown in the deferral section).")
     else:
         r1c3.metric("QBO P&L (txn date)", "—")
 
@@ -865,19 +889,30 @@ def render_book_revenue(payload: dict, month: str, entity: str) -> None:
     single figure-to-book unambiguous, separate from the reconciliation tiles."""
     if entity in FLUSH_PRODUCTS:
         return  # CTS: Book Revenue is shown in the flush-account section
-    prefixes = PL_REVENUE_PREFIXES.get(entity)
-    if not prefixes:
+    if entity not in BOOK_REVENUE_ACCOUNTS and not PL_REVENUE_PREFIXES.get(entity):
         return
-    book = _pl_total(payload, month, prefixes)
+    book = _book_revenue(payload, month, entity)
+    placement = 0.0
+    if PLACEMENT_ACCOUNTS.get(entity):
+        placement = _pl_total(payload, month, PLACEMENT_ACCOUNTS[entity],
+                              exclude_types=BOOK_REVENUE_EXCLUDE_TYPES.get(entity, ()))
+
     st.markdown("### Book revenue")
-    st.metric(f"Book Revenue — {month}", f"${book:,.2f}",
-              help=("Revenue-account (Primary Sales) lines booked in QBO with a "
-                    f"{month} transaction date — the amount to book to the P&L for "
-                    f"{month}. The 'QBO revenue (recon)' and 'Bullhorn billed' tiles "
-                    "above are reconciliation totals (they include Employee Advance / "
-                    "Employee Wages pass-throughs and use the service-week accounting "
-                    "bucket to match Bullhorn line-for-line), so they are intentionally "
-                    "larger and are NOT the figure to book."))
+    c1, c2 = st.columns(2)
+    c1.metric(f"Book Revenue — {month}", f"${book:,.2f}",
+              help=("The QBO P&L revenue line: Revenue-Sales invoices net of credit memos, "
+                    f"by {month} transaction date. Excludes the direct-hire Placement line "
+                    "(shown beside) and the manual DEFERRED REV journal entries (those are "
+                    "the month-end deferral — see the Deferral section below)."))
+    if placement:
+        c2.metric(f"Placement (separate P&L line) — {month}", f"${placement:,.2f}",
+                  help=("Direct-hire placement fees (Revenue-Placement). A separate income "
+                        "line on the QBO P&L, not part of the Revenue-Sales figure."))
+    st.caption(
+        "Book Revenue = the QBO Revenue-Sales line (billed). Direct-hire Placement is a "
+        "separate line. The DEFERRED REV journal entries are the month-end deferral and "
+        "appear in the Deferral section, not in Book Revenue."
+    )
 
 
 def _accrual_detail_df(items: list[dict]) -> "pd.DataFrame":
