@@ -796,7 +796,19 @@ def render_flush_section(payload: dict, month: str, entity: str) -> None:
         items, total = flush_lines(payload, month, code)
         results.append((label, code, items, total))
         total_flush = round(total_flush + total, 2)
-    book = round(gross - total_flush, 2)
+    book_billed = round(gross - total_flush, 2)
+
+    # Straddle accrual: revenue billed this month but earned in the prior month
+    # (accrue-back, out) and earned this month but billed next (accrue-in). The
+    # QBO P&L is stated AFTER this accrual, so Book Revenue must apply it too or
+    # it can never tie out in a straddle month.
+    acc_back = acc_in = 0.0
+    if entity in ENTITIES_WITH_ACCRUAL:
+        rev = REVENUE_ACCOUNT_PREFIXES.get(entity, [])
+        _, acc_back = accrual_items(payload, month, rev, "back")
+        _, acc_in = accrual_items(payload, month, rev, "in")
+    net_accrual = round(acc_in - acc_back, 2)
+    book_after = round(book_billed + net_accrual, 2)
 
     st.markdown("### Book revenue (flush-account adjustment)")
 
@@ -814,8 +826,20 @@ def render_flush_section(payload: dict, month: str, entity: str) -> None:
         for col, (lbl, val, help_txt) in zip(cols, row):
             col.metric(lbl, val, help=help_txt)
 
-    st.metric("Book Revenue", f"${book:,.2f}",
-              help="Revenue as booked minus all flush lines = what hits the P&L.")
+    if net_accrual:
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Book Revenue (billed)", f"${book_billed:,.2f}",
+                  help="Revenue as booked minus flush lines = billed revenue, before the straddle accrual.")
+        b2.metric("Net straddle accrual", f"${net_accrual:,.2f}",
+                  help="Accrue-in (earned this month, billed next) minus accrue-back (billed this "
+                       "month, earned prior). Detail is in the Accrual section below.")
+        b3.metric("Book Revenue (after accrual)", f"${book_after:,.2f}",
+                  help="Billed Book Revenue plus the net straddle accrual — this is the figure that "
+                       "ties to the QBO P&L revenue line, which is stated after the accrual.")
+    else:
+        st.metric("Book Revenue", f"${book_billed:,.2f}",
+                  help="Revenue as booked minus all flush lines = what hits the P&L. "
+                       "No straddle accrual this month, so billed and post-accrual are equal.")
 
     # Per-code line-item detail for verification.
     for label, code, items, total in results:
