@@ -54,7 +54,7 @@ ENTITIES_WITH_PERIOD_REMAP: set[str] = set()
 # attribution rule (CPL2 contractors billed through OTS) is confirmed from the
 # Canvas report definition. Override per entity with env BULLHORN_SOURCE_OTS /
 # BULLHORN_SOURCE_CTS (e.g. set BULLHORN_SOURCE_OTS=snowflake to cut OTS over).
-BULLHORN_SOURCE: dict[str, str] = {"ots": "xlsx", "cts": "xlsx"}
+BULLHORN_SOURCE: dict[str, str] = {"ots": "snowflake", "cts": "xlsx"}
 
 
 def bullhorn_source(entity: str) -> str:
