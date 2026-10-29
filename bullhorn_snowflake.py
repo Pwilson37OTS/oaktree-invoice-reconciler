@@ -23,11 +23,16 @@ Timesheet / Placement / JobOrder joins and can be enriched later; leaving them
 blank does not affect the reconciliation, which keys on candidate + date +
 amount.
 
-CTS attribution is intentionally NOT handled here yet: some CTS contractors are
-billed inter-company through OTS (CPL2 / "Interco Rec-OTS") and appear under
-Branch='OTS' in the mirror while the Canvas report lists them under CTS. That
-inclusion rule is not derivable from the charge/placement/candidate fields and
-is pending Brenda's Canvas report definition. OTS is clean (Branch='OTS').
+Entity selection (reproduces Brenda's Canvas report sets, see _entity_predicate):
+  OTS = Branch='OTS' (this already includes the CITGO inter-company contractors;
+        they appear in billable_charges.xlsx too and are flushed to CTS via CPL2
+        downstream).
+  CTS = Branch='CTS'  OR  (Branch='OTS' AND ClientCorporationid = 1462 / CITGO).
+        The second term is the inter-company set: CTS contractors billed on OTS
+        paper (CPL2 / "Interco Rec-OTS"). In the Canvas export these carry the
+        Branch2='1' tag. Validated 2026-10-29: the mirror's (Branch='OTS',
+        client=CITGO) set is byte-for-byte the 14 Branch2='1' contractors in
+        billable_charges_CTS.xlsx, with matching per-contractor gross.
 """
 from __future__ import annotations
 
@@ -36,13 +41,20 @@ from datetime import date, datetime, timedelta
 import mirror
 from parse_bullhorn import BHRow
 
-_BRANCH = {"ots": "OTS", "cts": "CTS"}
+# Clients whose OTS-billed charges belong to the other entity (inter-company).
+# CITGO (ClientCorporation 1462) is staffed by CTS but billed on OTS paper via
+# CPL2 / "Interco Rec-OTS", so its OTS charges roll into the CTS report.
+_INTERCO_CLIENT_IDS = {"cts": [1462]}
+
+# Canvas "Branch2" tag the drill-down shows, so the mirror matches the export:
+# 1 = billed on OTS paper, 2 = billed by CTS.
+_BRANCH2 = {"OTS": "1", "CTS": "2"}
 
 # Pull a bounded history by default so the reconciler's date range roughly
 # matches the Canvas export window; the engine's coverage clip aligns it to QBO.
 _DEFAULT_LOOKBACK_DAYS = 220
 
-_SQL = """
+_SQL_TEMPLATE = """
 SELECT bc."ID"            AS charge_id,
        bc."Candidateid"   AS candidate_id,
        bc."Description"    AS descr,
@@ -54,12 +66,32 @@ SELECT bc."ID"            AS charge_id,
 FROM BULLHORN_MIRROR."RAW"."BillableCharge" bc
 LEFT JOIN BULLHORN_MIRROR."RAW"."ClientCorporation" cc
        ON cc."ID" = bc."ClientCorporationid"
-WHERE bc."Branch" = ?
+WHERE {entity_pred}
   AND bc."Candidateid" IS NOT NULL
   AND bc."PeriodEndDate" IS NOT NULL
   AND bc."PeriodEndDate" >= ?
 ORDER BY bc."PeriodEndDate", bc."Candidateid"
 """
+
+
+def _entity_predicate(entity: str) -> tuple[str, list]:
+    """SQL predicate + qmark params selecting the charges that belong to `entity`,
+    reproducing Brenda's Canvas report selection (see module docstring).
+
+    OTS is simply Branch='OTS'. CTS is Branch='CTS' plus the inter-company set:
+    OTS-billed charges for an inter-company client (CITGO). Literals here are
+    trusted internal constants, not user input."""
+    if entity == "ots":
+        return 'bc."Branch" = ?', ["OTS"]
+    if entity == "cts":
+        ids = _INTERCO_CLIENT_IDS["cts"]
+        placeholders = ",".join("?" for _ in ids)
+        pred = (
+            '(bc."Branch" = ? '
+            f'OR (bc."Branch" = ? AND bc."ClientCorporationid" IN ({placeholders})))'
+        )
+        return pred, ["CTS", "OTS", *ids]
+    raise ValueError(f"Unknown entity {entity!r}")
 
 
 def _candidate_name(descr: str) -> str:
@@ -108,13 +140,12 @@ def load_bullhorn_mirror(
 ) -> list[BHRow]:
     """Billable charges for `entity` ('ots'/'cts') from the live mirror, as
     BHRow objects. `since` bounds the pull (default ~220 days back)."""
-    branch = _BRANCH.get(entity)
-    if branch is None:
-        raise ValueError(f"Unknown entity {entity!r}")
+    pred, pred_params = _entity_predicate(entity)
     if since is None:
         since = date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
 
-    df = mirror.query(_SQL, [branch, since.isoformat()])
+    sql = _SQL_TEMPLATE.format(entity_pred=pred)
+    df = mirror.query(sql, [*pred_params, since.isoformat()])
 
     rows: list[BHRow] = []
     for rec in df.itertuples(index=False):
@@ -138,7 +169,7 @@ def load_bullhorn_mirror(
                 gross_margin=0.0,
                 placement_id=_to_str(rec.PLACEMENT_ID),
                 period_end=ped,
-                branch=_to_str(rec.BRANCH),
+                branch=_BRANCH2.get(_to_str(rec.BRANCH), _to_str(rec.BRANCH)),
                 employee_type="",
                 apply_period_remap=apply_period_remap,
             )

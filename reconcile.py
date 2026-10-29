@@ -48,13 +48,14 @@ ENTITIES_WITH_PERIOD_REMAP: set[str] = set()
 #   "snowflake" — live BULLHORN_MIRROR via mirror.py (BillableCharge). Does not
 #                 need the Canvas export; immune to the export's degradation.
 #   "xlsx"      — legacy Canvas export in _shared / data/.
-# OTS is validated against the mirror (monthly totals tie within ~1%, the mirror
-# being slightly more complete; per-contractor weekly amounts match to the penny
-# on PeriodEndDate + Pre-taxAmount). CTS stays on xlsx until the inter-company
-# attribution rule (CPL2 contractors billed through OTS) is confirmed from the
-# Canvas report definition. Override per entity with env BULLHORN_SOURCE_OTS /
-# BULLHORN_SOURCE_CTS (e.g. set BULLHORN_SOURCE_OTS=snowflake to cut OTS over).
-BULLHORN_SOURCE: dict[str, str] = {"ots": "snowflake", "cts": "xlsx"}
+# Both entities are validated against the mirror (monthly totals tie within ~1%,
+# the mirror being slightly more complete; per-contractor weekly amounts match to
+# the penny on PeriodEndDate + Pre-taxAmount). For CTS the inter-company set (CITGO
+# contractors billed through OTS via CPL2) is folded in by bullhorn_snowflake's
+# _entity_predicate and reproduces the Canvas Branch2='1' rows exactly (Aug ties
+# penny-for-penny to the export; Sep is tighter than the export). Override per
+# entity with env BULLHORN_SOURCE_OTS / BULLHORN_SOURCE_CTS (e.g. =xlsx to revert).
+BULLHORN_SOURCE: dict[str, str] = {"ots": "snowflake", "cts": "snowflake"}
 
 
 def bullhorn_source(entity: str) -> str:
@@ -333,9 +334,11 @@ def reconcile_entity(entity: str, *, month: str | None = None,
 
     if use_mirror:
         from bullhorn_snowflake import load_bullhorn_mirror
-        log(f"Loading ATS  : BULLHORN_MIRROR (BillableCharge, Branch={entity.upper()})")
+        ats_source = f"BULLHORN_MIRROR:BillableCharge ({entity.upper()})"
+        log(f"Loading ATS  : {ats_source}")
         ats_rows = load_bullhorn_mirror(entity, apply_period_remap=apply_remap)
     else:
+        ats_source = str(ats_path)
         log(f"Loading ATS  : {ats_path.name}")
         ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(ats_rows)} rows")
@@ -409,7 +412,7 @@ def reconcile_entity(entity: str, *, month: str | None = None,
         "entity": entity,
         "entity_label": cfg["label"],
         "period": month or "all",
-        "sources": {"qbo": str(qbo_path), "ats": str(ats_path)},
+        "sources": {"qbo": str(qbo_path), "ats": ats_source},
         "coverage": coverage,
         "summary": {
             "qbo_total": round(sum(r.qbo_amount or 0 for r in reconciled), 2),
