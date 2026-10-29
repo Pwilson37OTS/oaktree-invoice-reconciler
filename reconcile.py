@@ -11,6 +11,7 @@ runs the same match logic as the legacy VBA macro, classifies, and writes:
 from __future__ import annotations
 import argparse
 import json
+import os
 from datetime import date, datetime
 from pathlib import Path
 
@@ -42,6 +43,23 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # deferral total for month-end. To re-enable remapping for an entity, add its
 # key back here.
 ENTITIES_WITH_PERIOD_REMAP: set[str] = set()
+
+# Per-entity Bullhorn data source:
+#   "snowflake" — live BULLHORN_MIRROR via mirror.py (BillableCharge). Does not
+#                 need the Canvas export; immune to the export's degradation.
+#   "xlsx"      — legacy Canvas export in _shared / data/.
+# OTS is validated against the mirror (monthly totals tie within ~1%, the mirror
+# being slightly more complete; per-contractor weekly amounts match to the penny
+# on PeriodEndDate + Pre-taxAmount). CTS stays on xlsx until the inter-company
+# attribution rule (CPL2 contractors billed through OTS) is confirmed from the
+# Canvas report definition. Override per entity with env BULLHORN_SOURCE_OTS /
+# BULLHORN_SOURCE_CTS (e.g. set BULLHORN_SOURCE_OTS=snowflake to cut OTS over).
+BULLHORN_SOURCE: dict[str, str] = {"ots": "xlsx", "cts": "xlsx"}
+
+
+def bullhorn_source(entity: str) -> str:
+    return (os.environ.get(f"BULLHORN_SOURCE_{entity.upper()}")
+            or BULLHORN_SOURCE.get(entity, "xlsx")).strip().lower()
 
 # Each entity has an ordered list of candidate paths. The first existing path
 # is used. Order: local OneDrive first (live data on Phil's machine), then
@@ -283,11 +301,21 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     cfg = ENTITY_CONFIG[entity]
     default_qbo, default_ats = entity_paths(entity)
     qbo_path = qbo_path or default_qbo
-    ats_path = ats_path or default_ats
-    if not (qbo_path and ats_path):
+    # An explicitly-passed ats_path (upload flow / validation) forces the xlsx
+    # loader; otherwise the configured source decides. QBO is always a file.
+    explicit_ats = ats_path is not None
+    use_mirror = (not explicit_ats) and bullhorn_source(entity) == "snowflake"
+    if not explicit_ats:
+        ats_path = default_ats
+    if not qbo_path:
         raise FileNotFoundError(
-            f"No source files found for {entity}. Checked: "
-            f"qbo={cfg['qbo_candidates']}, ats={cfg['ats_candidates']}"
+            f"No QBO source file found for {entity}. Checked: qbo={cfg['qbo_candidates']}"
+        )
+    if not use_mirror and not ats_path:
+        raise FileNotFoundError(
+            f"No Bullhorn source file found for {entity}. Checked: "
+            f"ats={cfg['ats_candidates']} (or set BULLHORN_SOURCE_{entity.upper()}=snowflake "
+            f"to read the live mirror)"
         )
     out_json = out_json or (OUT_DIR / f"{entity}_invoice_reconciliation_data.json")
     out_xlsx = out_xlsx or (OUT_DIR / f"audit_{entity}_{month or 'all'}.xlsx")
@@ -303,8 +331,13 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     qbo_rows = load_qbo(qbo_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(qbo_rows)} rows")
 
-    log(f"Loading ATS  : {ats_path.name}")
-    ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
+    if use_mirror:
+        from bullhorn_snowflake import load_bullhorn_mirror
+        log(f"Loading ATS  : BULLHORN_MIRROR (BillableCharge, Branch={entity.upper()})")
+        ats_rows = load_bullhorn_mirror(entity, apply_period_remap=apply_remap)
+    else:
+        log(f"Loading ATS  : {ats_path.name}")
+        ats_rows = load_bullhorn(ats_path, apply_period_remap=apply_remap)
     log(f"  parsed {len(ats_rows)} rows")
 
     # Capture the FULL, unclipped QBO line set now — before the coverage clip.

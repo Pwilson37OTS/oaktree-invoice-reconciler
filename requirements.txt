@@ -6,3 +6,9 @@
 streamlit==1.56.0
 pandas>=2.2,<3.1
 openpyxl>=3.1,<4
+
+# Bullhorn data now comes live from BULLHORN_MIRROR (Snowflake) via mirror.py,
+# replacing the degraded Canvas xlsx export. Same service account / key-pair as
+# the Tickler portal. See .streamlit/secrets.toml.example.
+snowflake-connector-python[pandas]>=3.12
+cryptography>=42.0
