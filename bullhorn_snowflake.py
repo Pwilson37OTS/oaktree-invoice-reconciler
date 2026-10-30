@@ -54,25 +54,6 @@ _BRANCH2 = {"OTS": "1", "CTS": "2"}
 # matches the Canvas export window; the engine's coverage clip aligns it to QBO.
 _DEFAULT_LOOKBACK_DAYS = 220
 
-_SQL_TEMPLATE = """
-SELECT bc."ID"            AS charge_id,
-       bc."Candidateid"   AS candidate_id,
-       bc."Description"    AS descr,
-       cc."CompanyName"    AS client,
-       bc."PeriodEndDate"  AS period_end,
-       bc."Pre-taxAmount"  AS gross_sales,
-       bc."Placementid"    AS placement_id,
-       bc."Branch"         AS branch
-FROM BULLHORN_MIRROR."RAW"."BillableCharge" bc
-LEFT JOIN BULLHORN_MIRROR."RAW"."ClientCorporation" cc
-       ON cc."ID" = bc."ClientCorporationid"
-WHERE {entity_pred}{invoiced_clause}
-  AND bc."Candidateid" IS NOT NULL
-  AND bc."PeriodEndDate" IS NOT NULL
-  AND bc."PeriodEndDate" >= ?
-ORDER BY bc."PeriodEndDate", bc."Candidateid"
-"""
-
 # This engine reconciles INVOICES against QBO, not raw billable charges. A
 # billable charge exists as soon as time is approved, but QBO only holds what was
 # actually invoiced, so a never-invoiced charge has no QBO counterpart and
@@ -81,21 +62,50 @@ ORDER BY bc."PeriodEndDate", bc."Candidateid"
 # at all -- the client is billed one flat monthly charge -- so summing the weekly
 # charges both double-counts and mis-states the invoice. Example (verified
 # 2026-10-30): Jose Guerrero's weekly charges ($4,191 / $8,543 / $2,901) carry
-# zero invoiced transactions, while a single flat $20,000 charge is the actual
+# zero invoiced transactions, while a single flat $20,220 charge is the actual
 # invoice.
 #
-# The right "was this invoiced" signal is the presence of a row in
-# BillableChargeInvoicedTransaction (the charge->invoice link), NOT the
-# "Invoiced?" boolean on BillableCharge: that flag is stale in the mirror (Aug
-# 2026: 199 of 213 OTS charges flagged false actually have invoiced
-# transactions). So filter on EXISTS in the link table. The Canvas export did the
-# equivalent -- its "Invoice Date" column (== Billing Period End Date on every
-# row) is only populated for invoiced charges, and the loader skips blank-date
-# rows.
-_INVOICED_CLAUSE = (
-    '\n  AND EXISTS (SELECT 1 FROM BULLHORN_MIRROR."RAW"."BillableChargeInvoicedTransaction" t'
-    '\n               WHERE t."ChargeID" = bc."ID")'
+# So the invoiced universe (and the billed amount) comes from
+# BillableChargeInvoicedTransaction, the charge->invoice link -- NOT from
+# BillableCharge. We do NOT use the "Invoiced?" boolean: it is stale in the mirror
+# (Aug 2026: 199 of 213 OTS charges flagged false actually have invoiced
+# transactions). The `invoiced` CTE sums each charge's linked transaction amounts
+# (netting any credit / rebill lines -- ~1 charge in 500 nets to something other
+# than its Pre-taxAmount), and the inner join to it both restricts to invoiced
+# charges and supplies the billed amount. The Canvas export did the equivalent --
+# its "Invoice Date" column (== Billing Period End Date on every row) is only
+# populated for invoiced charges, and the loader skips blank-date rows.
+#
+# invoiced_only=False keeps every billable charge at its raw Pre-taxAmount (a
+# left join, amount off BillableCharge) for inspecting the un-invoiced backlog.
+_SQL_TEMPLATE = """
+WITH invoiced AS (
+    SELECT it."ChargeID" AS charge_id, SUM(it."Amount") AS invoiced_amount
+    FROM BULLHORN_MIRROR."RAW"."BillableChargeInvoicedTransaction" it
+    GROUP BY it."ChargeID"
 )
+SELECT bc."ID"            AS charge_id,
+       bc."Candidateid"   AS candidate_id,
+       bc."Description"    AS descr,
+       cc."CompanyName"    AS client,
+       bc."PeriodEndDate"  AS period_end,
+       {amount_col}        AS gross_sales,
+       bc."Placementid"    AS placement_id,
+       bc."Branch"         AS branch
+FROM BULLHORN_MIRROR."RAW"."BillableCharge" bc
+{invoiced_join} invoiced inv ON inv.charge_id = bc."ID"
+LEFT JOIN BULLHORN_MIRROR."RAW"."ClientCorporation" cc
+       ON cc."ID" = bc."ClientCorporationid"
+WHERE {entity_pred}
+  AND bc."Candidateid" IS NOT NULL
+  AND bc."PeriodEndDate" IS NOT NULL
+  AND bc."PeriodEndDate" >= ?
+ORDER BY bc."PeriodEndDate", bc."Candidateid"
+"""
+
+# (invoiced_join, amount_col) per mode.
+_INVOICED_MODE = ("JOIN", "inv.invoiced_amount")       # billed amount, invoiced only
+_RAW_MODE = ("LEFT JOIN", 'bc."Pre-taxAmount"')        # every charge, raw amount
 
 
 def _entity_predicate(entity: str) -> tuple[str, list]:
@@ -173,9 +183,9 @@ def load_bullhorn_mirror(
     if since is None:
         since = date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
 
+    invoiced_join, amount_col = _INVOICED_MODE if invoiced_only else _RAW_MODE
     sql = _SQL_TEMPLATE.format(
-        entity_pred=pred,
-        invoiced_clause=_INVOICED_CLAUSE if invoiced_only else "",
+        entity_pred=pred, invoiced_join=invoiced_join, amount_col=amount_col,
     )
     df = mirror.query(sql, [*pred_params, since.isoformat()])
 
