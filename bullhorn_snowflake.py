@@ -66,12 +66,36 @@ SELECT bc."ID"            AS charge_id,
 FROM BULLHORN_MIRROR."RAW"."BillableCharge" bc
 LEFT JOIN BULLHORN_MIRROR."RAW"."ClientCorporation" cc
        ON cc."ID" = bc."ClientCorporationid"
-WHERE {entity_pred}
+WHERE {entity_pred}{invoiced_clause}
   AND bc."Candidateid" IS NOT NULL
   AND bc."PeriodEndDate" IS NOT NULL
   AND bc."PeriodEndDate" >= ?
 ORDER BY bc."PeriodEndDate", bc."Candidateid"
 """
+
+# This engine reconciles INVOICES against QBO, not raw billable charges. A
+# billable charge exists as soon as time is approved, but QBO only holds what was
+# actually invoiced, so a never-invoiced charge has no QBO counterpart and
+# manufactures a phantom ATS-only exception. This matters most for flat-rate
+# clients (e.g. ConocoPhillips): the weekly billable charges are never invoiced
+# at all -- the client is billed one flat monthly charge -- so summing the weekly
+# charges both double-counts and mis-states the invoice. Example (verified
+# 2026-10-30): Jose Guerrero's weekly charges ($4,191 / $8,543 / $2,901) carry
+# zero invoiced transactions, while a single flat $20,000 charge is the actual
+# invoice.
+#
+# The right "was this invoiced" signal is the presence of a row in
+# BillableChargeInvoicedTransaction (the charge->invoice link), NOT the
+# "Invoiced?" boolean on BillableCharge: that flag is stale in the mirror (Aug
+# 2026: 199 of 213 OTS charges flagged false actually have invoiced
+# transactions). So filter on EXISTS in the link table. The Canvas export did the
+# equivalent -- its "Invoice Date" column (== Billing Period End Date on every
+# row) is only populated for invoiced charges, and the loader skips blank-date
+# rows.
+_INVOICED_CLAUSE = (
+    '\n  AND EXISTS (SELECT 1 FROM BULLHORN_MIRROR."RAW"."BillableChargeInvoicedTransaction" t'
+    '\n               WHERE t."ChargeID" = bc."ID")'
+)
 
 
 def _entity_predicate(entity: str) -> tuple[str, list]:
@@ -137,14 +161,22 @@ def load_bullhorn_mirror(
     *,
     apply_period_remap: bool = True,
     since: date | None = None,
+    invoiced_only: bool = True,
 ) -> list[BHRow]:
-    """Billable charges for `entity` ('ots'/'cts') from the live mirror, as
-    BHRow objects. `since` bounds the pull (default ~220 days back)."""
+    """Invoiced charges for `entity` ('ots'/'cts') from the live mirror, as
+    BHRow objects. `since` bounds the pull (default ~220 days back).
+
+    invoiced_only (default True) restricts to charges Bullhorn has actually
+    invoiced, so the set is comparable to QBO; pass False only to inspect the
+    raw billable-charge universe (e.g. un-invoiced backlog)."""
     pred, pred_params = _entity_predicate(entity)
     if since is None:
         since = date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
 
-    sql = _SQL_TEMPLATE.format(entity_pred=pred)
+    sql = _SQL_TEMPLATE.format(
+        entity_pred=pred,
+        invoiced_clause=_INVOICED_CLAUSE if invoiced_only else "",
+    )
     df = mirror.query(sql, [*pred_params, since.isoformat()])
 
     rows: list[BHRow] = []

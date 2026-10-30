@@ -334,7 +334,7 @@ def reconcile_entity(entity: str, *, month: str | None = None,
 
     if use_mirror:
         from bullhorn_snowflake import load_bullhorn_mirror
-        ats_source = f"BULLHORN_MIRROR:BillableCharge ({entity.upper()})"
+        ats_source = f"BULLHORN_MIRROR:invoiced charges ({entity.upper()})"
         log(f"Loading ATS  : {ats_source}")
         ats_rows = load_bullhorn_mirror(entity, apply_period_remap=apply_remap)
     else:
