@@ -360,7 +360,8 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     # The recent tail is NOT clipped — Bullhorn charges past QBO's latest date
     # are legitimate "not yet invoiced" items worth surfacing.
     coverage = {"qbo_min": None, "qbo_max": None, "ats_min": None, "ats_max": None,
-                "clip_start": None, "excluded_ats_count": 0, "excluded_ats_total": 0.0}
+                "clip_start": None, "excluded_ats_count": 0, "excluded_ats_total": 0.0,
+                "rescued_cts_cm_keys": 0}
     # QBO coverage floor = earliest TRANSACTION date (the export's booking
     # window), NOT the service-week date parsed from descriptions. A handful of
     # late/corrected invoices booked in-window can reference old service weeks;
@@ -374,18 +375,43 @@ def reconcile_entity(entity: str, *, month: str | None = None,
                         ats_min=ats_min.isoformat(), ats_max=ats_max.isoformat())
         clip_start = max(qbo_min, ats_min)
         if clip_start > ats_min:
-            # Clip both sides by service-week (effective) date so a Bullhorn
-            # charge and its QBO invoice drop together — no orphaned QBO_ONLY.
-            excluded = [r for r in ats_rows if (_effective_date(r) or clip_start) < clip_start]
+            # Normally we clip both sides by service-week (effective) date so a
+            # Bullhorn charge and its QBO invoice drop together (no orphaned
+            # QBO_ONLY). One class must survive the clip, though: an inter-
+            # company credit memo (customer = "CTS") booked INSIDE the window
+            # that reverses a service week BEFORE the window. That is a real,
+            # in-window accounting action, and when CTS revenue is reversed on
+            # OTS paper it belongs in front of someone. Without this rescue it
+            # vanishes below the clip -- ~$332K of such CTS credit memos were
+            # silently invisible (booked 10/01 for July service weeks, floor
+            # 08/10). We keep those specific keys on BOTH sides so the reversal
+            # reconciles against whatever Bullhorn still shows for the week.
+            # NB: the rescue is keyed on service week, so these surface in the
+            # all-months view (and the service-week month), not the booking month.
+            rescue_keys = {
+                r.key for r in qbo_rows
+                if r.key
+                and (r.txn_type or "").strip() == "Credit Memo"
+                and (r.customer or "").strip().upper() == "CTS"
+                and r.txn_date and r.txn_date >= clip_start
+                and (_effective_date(r) or clip_start) < clip_start
+            }
+
+            def _in_window(r):
+                return (_effective_date(r) or clip_start) >= clip_start or (r.key in rescue_keys)
+
+            excluded = [r for r in ats_rows if not _in_window(r)]
             coverage["clip_start"] = clip_start.isoformat()
             coverage["excluded_ats_count"] = len(excluded)
             coverage["excluded_ats_total"] = round(sum(r.gross_sales_amount for r in excluded), 2)
-            ats_rows = [r for r in ats_rows if (_effective_date(r) or clip_start) >= clip_start]
-            qbo_rows = [r for r in qbo_rows if (_effective_date(r) or clip_start) >= clip_start]
+            coverage["rescued_cts_cm_keys"] = len(rescue_keys)
+            ats_rows = [r for r in ats_rows if _in_window(r)]
+            qbo_rows = [r for r in qbo_rows if _in_window(r)]
             log(f"  coverage clip: reconciling from {clip_start} onward "
                 f"(QBO booked from {qbo_min}, Bullhorn from {ats_min}); "
                 f"excluded {coverage['excluded_ats_count']} pre-window Bullhorn charges "
-                f"(${coverage['excluded_ats_total']:,.2f})")
+                f"(${coverage['excluded_ats_total']:,.2f}); "
+                f"rescued {len(rescue_keys)} in-window CTS credit-memo key(s)")
 
     if month:
         before = len(ats_rows)
