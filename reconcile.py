@@ -133,6 +133,26 @@ def _filter_by_month(rows, month: str | None):
     return out
 
 
+def _review_month(row, clip_boundary) -> str:
+    """Month bucket (YYYY-MM) for the monthly-review filter, applied to a whole
+    reconciled row.
+
+    Normal rows bucket by their service-week (key) date -- identical to filtering
+    the raw rows by effective date, since every line on a key shares that date.
+
+    A row whose service week falls BEFORE the coverage window (a rescued late
+    booking -- e.g. a CTS credit memo booked this period that reverses a closed
+    service week) buckets by its latest QBO booking date instead, so it surfaces
+    in the period it hit the books rather than a closed service month nobody
+    reviews. Falls back to the service week if the row carries no QBO date."""
+    d = row.billing_date
+    if clip_boundary and d < clip_boundary:
+        txns = [q.txn_date for q in row.qbo_rows if q.txn_date]
+        if txns:
+            d = max(txns)
+    return f"{d.year:04d}-{d.month:02d}"
+
+
 def _qbo_contractor(desc: str) -> str:
     """Best-effort contractor name from a QBO description like
     '58363, Angela Hardin - Expense - 2026-04-03' -> 'Angela Hardin'."""
@@ -366,6 +386,8 @@ def reconcile_entity(entity: str, *, month: str | None = None,
     # window), NOT the service-week date parsed from descriptions. A handful of
     # late/corrected invoices booked in-window can reference old service weeks;
     # those must not drag the floor back and defeat the clip.
+    clip_boundary = None  # set when a front clip is applied; _review_month uses
+                          # it to re-bucket rescued pre-window rows by booking month.
     qbo_txn = [r.txn_date for r in qbo_rows if r.txn_date]
     bh_inv = [r.invoice_date for r in ats_rows if r.invoice_date]
     if qbo_txn and bh_inv:
@@ -386,8 +408,10 @@ def reconcile_entity(entity: str, *, month: str | None = None,
             # silently invisible (booked 10/01 for July service weeks, floor
             # 08/10). We keep those specific keys on BOTH sides so the reversal
             # reconciles against whatever Bullhorn still shows for the week.
-            # NB: the rescue is keyed on service week, so these surface in the
-            # all-months view (and the service-week month), not the booking month.
+            # The rescue is keyed on service week, but the monthly-review filter
+            # below re-buckets these into their QBO booking month (see
+            # _review_month), so a reversal booked this month is reviewed this
+            # month rather than in the closed service month it points back to.
             rescue_keys = {
                 r.key for r in qbo_rows
                 if r.key
@@ -405,6 +429,7 @@ def reconcile_entity(entity: str, *, month: str | None = None,
             coverage["excluded_ats_count"] = len(excluded)
             coverage["excluded_ats_total"] = round(sum(r.gross_sales_amount for r in excluded), 2)
             coverage["rescued_cts_cm_keys"] = len(rescue_keys)
+            clip_boundary = clip_start
             ats_rows = [r for r in ats_rows if _in_window(r)]
             qbo_rows = [r for r in qbo_rows if _in_window(r)]
             log(f"  coverage clip: reconciling from {clip_start} onward "
@@ -413,17 +438,20 @@ def reconcile_entity(entity: str, *, month: str | None = None,
                 f"(${coverage['excluded_ats_total']:,.2f}); "
                 f"rescued {len(rescue_keys)} in-window CTS credit-memo key(s)")
 
-    if month:
-        before = len(ats_rows)
-        ats_rows = _filter_by_month(ats_rows, month)
-        log(f"  filtered to {month}: {before} -> {len(ats_rows)} ATS rows")
-        before = len(qbo_rows)
-        qbo_rows = _filter_by_month(qbo_rows, month)
-        log(f"  filtered to {month}: {before} -> {len(qbo_rows)} QBO rows")
-
     log("Reconciling...")
     reconciled = reconcile(qbo_rows, ats_rows)
     classify(reconciled)
+
+    # Monthly-review filter runs AFTER reconciliation, on whole reconciled rows,
+    # so each row lands in exactly one month. Normal rows bucket by service-week
+    # month (identical to the old pre-reconcile filter). Rows whose service week
+    # precedes the coverage window (rescued late bookings, e.g. a CTS credit memo
+    # booked this month for a closed week) bucket by their QBO booking month so
+    # they are reviewed when they hit the books, not in a closed service month.
+    if month:
+        before = len(reconciled)
+        reconciled = [r for r in reconciled if _review_month(r, clip_boundary) == month]
+        log(f"  filtered to {month}: {before} -> {len(reconciled)} reconciled rows")
 
     counts = status_counts(reconciled)
     log(f"  reconciled rows: {len(reconciled)}")
