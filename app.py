@@ -125,6 +125,17 @@ FLUSH_PRODUCTS: dict[str, list[tuple[str, str]]] = {
 # accrued to the month it was earned. (Uses the week-ending-Sunday rule.)
 ENTITIES_WITH_ACCRUAL = {"cts"}
 
+# Entities whose Month Close bucket follows the Monday-Sunday billing week's
+# ENDING SUNDAY, not the raw service-date calendar month. CTS clients report the
+# same week ending on different days (Technip/KBR Friday, Lummus Saturday, CITGO
+# et al. Sunday); bucketing by raw month splits one billing week across two
+# closes (e.g. Fri 10/30 + Sat 10/31 land in October while Sun 11/1 lands in
+# November). Keying off the week-ending Sunday keeps each week whole and in the
+# month its Sunday falls in. OTS uses the period_calendar anchor instead (see
+# ENTITIES_WITH_DEFERRAL); this is the display rule for everyone else. Scoped to
+# CTS per Phil, 2026-11-09.
+ENTITIES_WEEK_ENDING_SUNDAY = {"cts"}
+
 # A handful of OTS contractors bill on a biweekly rotation, invoiced on TUESDAYS
 # (everyone else bills Sun/Fri/Sat). Because their Tuesday cadence drifts against
 # the Friday-based payroll-period months, some of their invoices are booked one
@@ -174,7 +185,10 @@ def _accounting_month(d: date, entity: str) -> str:
     OTS assigns billing weeks to accounting months via the period_calendar
     cutoffs (e.g. 8/1-8/2 belong to July, 5/28-31 belong to June), so we bucket
     OTS by the anchor month — not the raw calendar month, which would split a
-    billing week across two closes. Other entities bucket by raw month.
+    billing week across two closes. CTS bills Mon-Sun weeks that clients report
+    ending on Fri/Sat/Sun, so it buckets by the week-ending Sunday's month (same
+    rule as _service_period) — a week ending Fri 10/30 or Sat 10/31 rolls up to
+    Sun 11/1 = November, not October. Any other entity buckets by raw month.
     NOTE: this only affects which month a row is *displayed* under; the deferral
     JE figure is computed separately from the raw QBO transaction lines and is
     unaffected by this bucketing.
@@ -182,6 +196,9 @@ def _accounting_month(d: date, entity: str) -> str:
     if entity in ENTITIES_WITH_DEFERRAL:  # OTS = period_calendar entities
         a = to_period_anchor(d)
         return f"{a.year:04d}-{a.month:02d}"
+    if entity in ENTITIES_WEEK_ENDING_SUNDAY:  # CTS = Mon-Sun week, labeled by ending Sunday
+        sunday = d + timedelta(days=(6 - d.weekday()))  # Mon=0..Sun=6; next Sun on/after d
+        return f"{sunday.year:04d}-{sunday.month:02d}"
     return f"{d.year:04d}-{d.month:02d}"
 
 
