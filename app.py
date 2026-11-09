@@ -202,14 +202,51 @@ def _accounting_month(d: date, entity: str) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
+def _parse_iso(s) -> date | None:
+    """Parse a 'YYYY-MM-DD' string (or the leading date of one) to a date, else None."""
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_accounting_month(row: dict, entity: str, clip_start: date | None) -> str:
+    """Month a reconciled row is displayed under in Month Close.
+
+    Normal rows bucket by _accounting_month on their service-week date (OTS =
+    period_calendar anchor, CTS = week-ending Sunday, others = raw month).
+
+    A RESCUED pre-window row (service week BEFORE the coverage clip, kept only
+    because it is a late in-window booking such as an inter-company credit memo
+    reversing an already-closed week) buckets by its QBO BOOKING month (latest
+    txn date) instead. Otherwise it would display in a service month that is
+    already closed and nobody would ever see it. Only rows below the clip floor
+    can hit this branch; every in-window row has billing_date >= clip_start.
+    Falls back to the service month if the row carries no QBO txn date.
+    """
+    d = _parse_iso(row.get("billing_date")) or date.min
+    if clip_start and d < clip_start:
+        txns = [t for t in (_parse_iso(q.get("txn_date")) for q in row.get("qbo_lines", [])) if t]
+        if txns:
+            bm = max(txns)
+            return f"{bm.year:04d}-{bm.month:02d}"
+    return _accounting_month(d, entity)
+
+
 def frame_payload(payload: dict) -> pd.DataFrame:
     """Convert the JSON `rows` list into a DataFrame with helper columns."""
     rows = payload.get("rows", [])
     df = pd.DataFrame(rows)
     if not df.empty:
         entity = payload.get("entity", "")
+        clip_start = _parse_iso((payload.get("coverage") or {}).get("clip_start"))
+        # Month bucket needs each row's booking (txn) dates and the clip floor to
+        # re-bucket rescued pre-window rows, so compute it per row from the raw
+        # `rows` list (aligned with df order) rather than a billing_date-only apply.
+        df["month"] = [_row_accounting_month(r, entity, clip_start) for r in rows]
         df["billing_date"] = pd.to_datetime(df["billing_date"]).dt.date
-        df["month"] = df["billing_date"].apply(lambda d: _accounting_month(d, entity))
         df["week_start"] = df["billing_date"].apply(_week_start)
         df["week_label"] = df["week_start"].apply(_week_label)
         df["qbo_amount"] = df["qbo_amount"].astype("float64")
